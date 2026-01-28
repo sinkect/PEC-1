@@ -1,85 +1,151 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
-
-from .bridge import Extruder
-
-
-def get_device():
-    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from pathlib import Path
+from .bridge import Extruder, SwiGLU
 
 
 class PECEngine(nn.Module):
-    """
-    PEC Engine that composes ModernBERT (Profiler) with Qwen 3 (Composer).
-    Shapes: [B, T, D]
-    """
-
     def __init__(
-        self,
-        profiler_path="answerdotai/ModernBERT-base",
-        composer_path="Qwen/Qwen3-Instruct",
-        num_query_tokens=64,
-        freeze_profiler=True,
-        freeze_composer=True,
+            self,
+            profiler_path="profiler",
+            composer_path="Qwen/Qwen3-1.7B",
+            num_query_tokens=512,
+            freeze_profiler=False,
+            freeze_composer=True,
     ):
         super().__init__()
-        self.device = get_device()
+        current_dir = Path(__file__).parent
+        # 1. Load Models
+        self.profiler = AutoModel.from_pretrained(str(current_dir / profiler_path), local_files_only=True,
+                                                  dtype=torch.bfloat16,
+                                                  attn_implementation="flash_attention_2") if torch.cuda.is_available() else AutoModel.from_pretrained(str(current_dir / profiler_path), local_files_only=True)
+        self.composer = AutoModelForCausalLM.from_pretrained(composer_path, dtype=torch.bfloat16,
+                                                             attn_implementation="flash_attention_2") if torch.cuda.is_available() else AutoModelForCausalLM.from_pretrained(composer_path)
 
-        self.profiler = AutoModel.from_pretrained(profiler_path)
-        self.composer = AutoModel.from_pretrained(composer_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(composer_path)
+        # 2. Dimensions
+        self.prof_dim = self.profiler.config.hidden_size
+        self.comp_dim = self.composer.config.hidden_size
 
+        # 3. Freeze
         if freeze_profiler:
-            for param in self.profiler.parameters():
-                param.requires_grad = False
+            self.profiler.requires_grad_(False)
         if freeze_composer:
-            for param in self.composer.parameters():
-                param.requires_grad = False
+            self.composer.requires_grad_(False)
 
-        self.profiler_tokenizer = AutoTokenizer.from_pretrained(profiler_path, use_fast=True)
-        self.composer_tokenizer = AutoTokenizer.from_pretrained(composer_path, use_fast=True)
-
+        # 4. Bridge Modules
         self.extruder = Extruder(
-            hidden_size=self.profiler.config.hidden_size,
+            hidden_size=self.prof_dim,
             num_query_tokens=num_query_tokens,
-        )
+            max_position_embeddings=self.profiler.config.max_position_embeddings,
+        )  # [B, S_doc, D_prof] -> [B, N_q, D_prof]
 
-        self.sep_token = nn.Parameter(
-            torch.randn(1, 1, self.profiler.config.hidden_size, dtype=torch.float16)
-        )
+        self.projector = nn.Sequential(
+            nn.Linear(self.prof_dim, self.comp_dim),
+            SwiGLU(self.comp_dim),
+            nn.Linear(self.comp_dim, self.comp_dim)
+        ) # [D_prof] -> [D_comp]
 
-        self.to(self.device, dtype=torch.float16)
+        self.post_extruder_norm = nn.RMSNorm(self.prof_dim, eps=1e-6)
+        self.sep_token = nn.Parameter(torch.randn(1, 1, self.comp_dim))  # [1, 1, D_comp]
 
-    def forward(self, profiler_input_ids, profiler_attention_mask, composer_input_ids, composer_attention_mask):
+        self.pad_token_id = self.composer.config.pad_token_id
+        if self.pad_token_id is None:
+            self.pad_token_id = self.composer.config.eos_token_id
+
+
+        # Prepare special tokens
+        u_end_ids = self.tokenizer("<|im_end|>\n", return_tensors="pt", add_special_tokens=False).input_ids
+        a_start_ids = self.tokenizer("<|im_start|>assistant\n", return_tensors="pt",
+                                     add_special_tokens=False).input_ids
+
+        self.register_buffer("u_end_ids", u_end_ids, persistent=False)
+        self.register_buffer("a_start_ids", a_start_ids, persistent=False)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.extruder.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+        for m in self.projector.modules():
+            if isinstance(m, nn.Linear):
+                torch.nn.init.normal_(m.weight, mean=0.0, std=0.04)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        nn.init.normal_(self.sep_token, mean=0.0, std=0.04)
+
+        nn.init.ones_(self.post_extruder_norm.weight)
+
+    def forward(self, profiler_input_ids, profiler_attention_mask,qwen_prompt_ids,
+                labels=None):
         """
-        profiler_input_ids: [B, T]
-        profiler_attention_mask: [B, T]
-        composer_input_ids: [B, T]
-        composer_attention_mask: [B, T]
+        profiler_input_ids: [Batch, Doc_Len + Prompt_Len] (Full Context)
+        composer_input_ids: [Batch, Trigger_Len] (Static Trigger e.g., <|im_start|>assistant)
         """
-        profiler_input_ids = profiler_input_ids.to(self.device)
-        profiler_attention_mask = profiler_attention_mask.to(self.device)
-        composer_input_ids = composer_input_ids.to(self.device)
-        composer_attention_mask = composer_attention_mask.to(self.device)
+        device = self.composer.device
+        batch_size = profiler_input_ids.shape[0]
+        embed_fn = self.composer.get_input_embeddings()
 
-        profiler_outputs = self.profiler(
-            input_ids=profiler_input_ids,
-            attention_mask=profiler_attention_mask,
+        # --- [Phase 1] Profiler & Extruder (Compression) ---
+        prof_outputs = self.profiler(
+            input_ids=profiler_input_ids.to(device),
+            attention_mask=profiler_attention_mask.to(device),
         )
-        profiler_hidden = profiler_outputs.last_hidden_state
+        prof_hidden = prof_outputs.last_hidden_state  # [B, Seq_P, D_prof]
 
-        extruded = self.extruder(profiler_hidden)
+        extruded = self.extruder(context=prof_hidden,attn_mask=profiler_attention_mask.to(device))  # [B, N_q, D_prof]
+        extruded = self.post_extruder_norm(extruded)
+        projected = self.projector(extruded)  # [B, N_q, D_comp]
 
-        sep_token = self.sep_token.to(device=self.device, dtype=extruded.dtype)
-        sep_token = sep_token.repeat(extruded.size(0), 1, 1)
+        # Add Separator
+        sep = self.sep_token.expand(batch_size, -1, -1).to(projected.dtype)
+        latents_embeds = torch.cat([projected, sep], dim=1)  # [B, N_q + 1, D_comp]
 
-        # Concatenate [B, Q, D] + [B, 1, D]
-        composer_prefix = torch.cat([extruded, sep_token], dim=1)
+        # ------------------------------------------------------------------
+        # [Phase 2] Construct ChatML Template
+        # Structure: <|im_start|>user\n [Latents] <|im_end|>\n <|im_start|>assistant\n
+        # ------------------------------------------------------------------
 
-        composer_outputs = self.composer(
-            input_ids=composer_input_ids,
-            attention_mask=composer_attention_mask,
+        # Embed and expand to batch size
+        prompt_embeds = embed_fn(qwen_prompt_ids.to(device))
+        u_end_emb = embed_fn(self.u_end_ids).expand(batch_size, -1, -1)  # [B, 1, D_comp]
+        a_start_emb = embed_fn(self.a_start_ids).expand(batch_size, -1, -1)  # [B, 1, D_comp]
+
+        # 2. Answer Embeddings (Labels)
+        labels = labels.to(device)
+        answer_embeds = embed_fn(labels)  # [B, Ans_Len, D_comp]
+
+        # --- [Phase 3] Concatenation ---
+        # Qwen sees: [User Start] + [Latents] + [User End] + [Assistant Start] + [Answer]
+        inputs_embeds = torch.cat([prompt_embeds, latents_embeds, u_end_emb, a_start_emb, answer_embeds], dim=1).to(
+            device)
+        prefix_len = prompt_embeds.shape[1] + latents_embeds.shape[1] + u_end_emb.shape[1] + a_start_emb.shape[1]
+
+        # --- [Phase 4] Masks & Labels ---
+        # 1. Attention Mask
+        inputs_mask = torch.ones((batch_size, prefix_len), device=device,dtype=torch.long)
+        ans_mask = (labels != self.pad_token_id).long()
+
+        combined_mask = torch.cat([inputs_mask, ans_mask], dim=1)
+
+        # 2. Labels for Loss Calculation
+        # Ignore Prefix (-100)
+        ignore_prefix = torch.full((batch_size, prefix_len), -100, device=device, dtype=labels.dtype)
+
+        labels_padding = labels.clone()
+        labels_padding[labels == self.pad_token_id] = -100
+
+        combined_labels = torch.cat([ignore_prefix, labels_padding], dim=1)
+
+        # --- [Phase 5] Generation / Loss ---
+        outputs = self.composer(
+            inputs_embeds=inputs_embeds,
+            attention_mask=combined_mask,
+            labels=combined_labels
         )
-        composer_hidden = composer_outputs.last_hidden_state
 
-        return composer_prefix, composer_hidden
+        return outputs

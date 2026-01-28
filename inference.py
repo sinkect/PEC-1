@@ -4,7 +4,7 @@ from models.architecture import PECEngine
 
 
 def get_device():
-    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 
 def generate(model, doc_text, prompt_text):
