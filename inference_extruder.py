@@ -1,126 +1,183 @@
 import torch
-from transformers import AutoTokenizer
-from datasets import load_dataset
 from pathlib import Path
+from typing import Optional, Tuple
+from transformers import AutoTokenizer, PreTrainedTokenizer
+
+# Import your model definition
 from models.architecture import PECEngine
 
 
-def main():
-    # ------------------------------------------------------------------
-    # 1. 설정 및 모델 로드
-    # ------------------------------------------------------------------
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Using device: {device}")
+class PECPredictor:
+    """Wrapper class for running inference with the PEC model.
 
-    base_dir = Path(__file__).parent
-    checkpoint_path = base_dir / "models/extruder/pytorch_model.bin"  # 경로 확인 필요
+    Handles loading the trained weights, processing inputs for both Profiler
+    and Composer, and executing the generation loop with soft prompt injection.
+    """
 
-    print("Loading Model Architecture...")
-    model = PECEngine(profiler_path="profiler", composer_path="Qwen/Qwen3-1.7B")
+    def __init__(
+            self,
+            checkpoint_dir: str,
+            profiler_path: str = "models/profiler",  # Path to local or HF model
+            composer_path: str = "Qwen/Qwen3-1.7B",
+            device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    ):
+        """Initializes the predictor.
 
-    if checkpoint_path.exists():
-        print(f"Loading Weights from {checkpoint_path}...")
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
-        model.load_state_dict(state_dict)
-    else:
-        print(f"Error: Checkpoint not found at {checkpoint_path}")
-        return
+        Args:
+            checkpoint_dir: Path to the directory containing 'pytorch_model.bin' (Extruder weights).
+            profiler_path: Path or HF ID for the Profiler (Encoder).
+            composer_path: Path or HF ID for the Composer (Decoder).
+            device: Device to run inference on.
+        """
+        self.device = torch.device(device)
+        self.base_dir = Path(checkpoint_dir)
 
-    model.half().to(device)
-    model.eval()
+        print(f"Loading PEC Engine on {self.device}...")
 
-    print("Loading Tokenizers...")
-    profiler_tokenizer = AutoTokenizer.from_pretrained(base_dir / "models/profiler", use_fast=True)
-    composer_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B", use_fast=True)
+        # 1. Initialize Model Architecture
+        self.model = PECEngine(
+            profiler_path=profiler_path,
+            composer_path=composer_path,
+            freeze_profiler=True,  # No gradients needed for inference
+            freeze_composer=True
+        )
 
-    # ------------------------------------------------------------------
-    # 2. 추론 루프
-    # ------------------------------------------------------------------
-    print("Loading Dataset...")
-    dataset = load_dataset("ChicagoHAI/CaseSumm", split="train")
-    dataset = dataset.select(range(len(dataset) - 5, len(dataset)))  # 5개 테스트
+        # 2. Load Trained Weights (Extruder & Projector)
+        weights_path = self.base_dir / "pytorch_model.bin"
+        if weights_path.exists():
+            print(f"Loading trained weights from {weights_path}")
+            state_dict = torch.load(weights_path, map_location="cpu")
+            # Load with strict=False because we only care about Extruder/Projector
+            # keys matching. Profiler/Composer might be loaded from base config.
+            self.model.load_state_dict(state_dict, strict=False)
+        else:
+            print("Warning: No checkpoint found! Using random initialization (Debug mode).")
 
-    print("\nStarting Inference (Trigger-Based Mode)...\n")
+        self.model.to(self.device)
+        self.model.eval()
 
-    for i, example in enumerate(dataset):
-        doc = example.get("opinion") or example.get("text")
-        target_text = example.get("syllabus") or example.get("summary")
-        if not doc: continue
+        # 3. Load Tokenizers
+        print("Loading tokenizers...")
+        self.profiler_tokenizer = AutoTokenizer.from_pretrained(profiler_path)
+        self.composer_tokenizer = AutoTokenizer.from_pretrained(composer_path, trust_remote_code=True)
 
-        # [수정 1] Profiler 입력: 학습 때처럼 "본문 + 프롬프트" 결합
-        # 프롬프트도 압축 대상에 포함시켜야 모델이 뭘 해야 할지 압니다.
-        prompt = "Summarize the facts, procedural history, and holding of the following case.",
-        full_input = f"--- INSTRUCTION ---\n{prompt}\n\n--- SOURCE DOCUMENT ---\n{doc}"
+    @torch.no_grad()
+    def predict(
+            self,
+            query: str,
+            context: str,
+            max_new_tokens: int = 512,
+            temperature: float = 0.7
+    ) -> str:
+        """Generates an answer for a given query and context.
 
-        p_inputs = profiler_tokenizer(
-            full_input,
+        Args:
+            query: The user question.
+            context: The long document context.
+            max_new_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+
+        Returns:
+            The generated answer string.
+        """
+
+        # --- Step 1: Profiler Processing (Compression) ---
+        # Format input for Profiler
+        prof_text = f"Instruction: {query}\nContext: {context}"
+        prof_inputs = self.profiler_tokenizer(
+            prof_text,
             return_tensors="pt",
             truncation=True,
-            max_length=8192
-        ).to(device)
+            max_length=8192  # Adjust based on your Profiler's limit
+        ).to(self.device)
 
-        with torch.no_grad():
-            # --- Step 1: Extruder로 압축 (Latents 생성) ---
-            prof_outputs = model.profiler(
-                input_ids=p_inputs.input_ids,
-                attention_mask=p_inputs.attention_mask
-            )
-            prof_hidden = prof_outputs.last_hidden_state.to(dtype=model.composer.dtype)
+        # Forward pass through Profiler + Extruder + Projector
+        # Extract logic from PECEngine to get soft prompts manually
+        prof_outputs = self.model.profiler(**prof_inputs)
+        prof_hidden = prof_outputs.last_hidden_state
 
-            extruded = model.extruder(context=prof_hidden, attn_mask=p_inputs.attention_mask.to(device))
-            projected = model.projector(extruded)
+        extruded = self.model.extruder(context=prof_hidden, attn_mask=prof_inputs["attention_mask"])
+        extruded = self.model.post_extruder_norm(extruded)
+        soft_prompts = self.model.projector(extruded)  # Shape: [1, Num_Query, D_comp]
 
-            # Separator 추가
-            batch_size = projected.shape[0]
-            sep = model.sep_token.expand(batch_size, -1, -1).to(dtype=projected.dtype, device=device)
-            latents_embeds = torch.cat([projected, sep], dim=1)
+        # --- Step 2: Composer Input Preparation ---
+        # Unlike training, we provide the CLEAN context (or slightly processed)
+        # to leverage the "Deep Reading" effect (Soft Prompts + Original Text).
 
-            # ------------------------------------------------------------------
-            # [수정 2] Trigger 추가 (학습 환경 재현)
-            # ------------------------------------------------------------------
-            # 학습 때 Composer는 "<|im_start|>assistant\n"만 보고 생성을 시작했습니다.
-            # 추론 때도 이 '시작 신호'를 줘야 Latents를 읽고 답을 합니다.
+        # ChatML Format
+        prompt = (
+            f"<|im_start|>user\n"
+            f"{query}\n\nContext:\n{context}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
 
-            a_start_text = "<|im_start|>assistant\n"
-            a_start_ids = composer_tokenizer(a_start_text, return_tensors="pt").input_ids.to(device)
-            a_start_embeds = model.composer.get_input_embeddings()(a_start_ids)
+        comp_inputs = self.composer_tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=4096  # Leave space for generation
+        ).to(self.device)
 
-            u_start_text = "<|im_start|>user\n"
-            u_start_ids = composer_tokenizer(u_start_text, return_tensors="pt").input_ids.to(device)
-            u_start_embeds = model.composer.get_input_embeddings()(u_start_ids)
-            u_end_text = "<|im_end|>\n"
-            u_end_ids = composer_tokenizer(u_end_text, return_tensors="pt").input_ids.to(device)
-            u_end_embeds = model.composer.get_input_embeddings()(u_end_ids)
+        # Get embeddings for the text part
+        text_embeds = self.model.composer.get_input_embeddings()(comp_inputs["input_ids"])
 
-            # [Trigger] + [Latents] 순서로 결합
-            # Qwen은 "Assistant Start" 신호를 보고 -> "Latents"를 참고하여 -> "답변"을 생성함
-            combined_embeds = torch.cat([u_start_embeds, latents_embeds, u_end_embeds, a_start_embeds], dim=1)
+        # --- Step 3: Combine Embeddings (Injection) ---
+        # Prepend Soft Prompts to the actual text embeddings
+        # Input: [Soft Prompts] + [User Instruction & Context]
+        final_inputs_embeds = torch.cat([soft_prompts, text_embeds], dim=1)
 
-            attention_mask = torch.ones(
-                combined_embeds.shape[:2],
-                dtype=torch.long,
-                device=device
-            )
+        # Create Attention Mask
+        # 1s for soft prompts + original mask
+        prompt_len = soft_prompts.shape[1]
+        batch_size = soft_prompts.shape[0]
+        prompt_mask = torch.ones((batch_size, prompt_len), device=self.device, dtype=torch.long)
+        final_attention_mask = torch.cat([prompt_mask, comp_inputs["attention_mask"]], dim=1)
 
-            # --- Step 2: 생성 (Generate) ---
-            generated_ids = model.composer.generate(
-                inputs_embeds=combined_embeds,
-                attention_mask=attention_mask,
-                max_new_tokens=512,
-                do_sample=True,
-                temperature=0.4,
-                top_p=0.9,
-                repetition_penalty=1.1,
-                pad_token_id=composer_tokenizer.eos_token_id
-            )
+        # --- Step 4: Generation ---
+        output_ids = self.model.composer.generate(
+            inputs_embeds=final_inputs_embeds,
+            attention_mask=final_attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=True if temperature > 0 else False,
+            pad_token_id=self.composer_tokenizer.eos_token_id,
+            eos_token_id=self.composer_tokenizer.eos_token_id
+        )
 
-        output_text = composer_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        # Decode output
+        generated_text = self.composer_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        return generated_text
 
-        print(f"--- Example {i + 1} ---")
-        print(f"[Input Length]: {len(doc.split())} words")
-        print(f"[Generated Summary]:\n{output_text}\n")
-        print(f"[Ground Truth]:\n{target_text[:200]}... (생략)\n")
-        print("=" * 50)
+
+def main():
+    # Example Usage
+    checkpoint_dir = "outputs/extruder"  # Where train_pec.py saved the model
+
+    # Check if checkpoint exists
+    if not Path(checkpoint_dir).exists():
+        print(f"Error: Checkpoint directory '{checkpoint_dir}' not found.")
+        print("Please run train_pec.py first.")
+        return
+
+    predictor = PECPredictor(checkpoint_dir=checkpoint_dir)
+
+    # Test Data
+    context = """
+        The 'PEC Model' is a novel architecture consisting of a Profiler, Extruder, and Composer.
+        The Profiler uses Modern-BERT to encode long contexts. 
+        The Extruder uses Learnable Queries to compress information into soft prompts.
+        The Composer (Qwen) uses these prompts to generate answers.
+        """
+    query = "What represents the Profiler in the PEC architecture?"
+
+    print("\n" + "=" * 50)
+    print(f"Query: {query}")
+    print("-" * 50)
+
+    answer = predictor.predict(query, context)
+
+    print(f"Answer: {answer}")
+    print("=" * 50 + "\n")
 
 
 if __name__ == "__main__":

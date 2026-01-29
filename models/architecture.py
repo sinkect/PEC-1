@@ -10,7 +10,7 @@ class PECEngine(nn.Module):
             self,
             profiler_path="profiler",
             composer_path="Qwen/Qwen3-1.7B",
-            num_query_tokens=512,
+            num_query_tokens=64,
             freeze_profiler=False,
             freeze_composer=True,
     ):
@@ -80,72 +80,74 @@ class PECEngine(nn.Module):
 
         nn.init.ones_(self.post_extruder_norm.weight)
 
-    def forward(self, profiler_input_ids, profiler_attention_mask,qwen_prompt_ids,
-                labels=None):
+    def forward(
+            self,
+            profiler_input_ids,
+            profiler_attention_mask,
+            composer_input_ids,
+            composer_attention_mask,
+            labels=None
+    ):
         """
-        profiler_input_ids: [Batch, Doc_Len + Prompt_Len] (Full Context)
-        composer_input_ids: [Batch, Trigger_Len] (Static Trigger e.g., <|im_start|>assistant)
+        New Forward Logic for Dynamic Masking Pipeline.
+
+        Args:
+            profiler_input_ids: Clean text for Encoder [B, Seq_Enc]
+            composer_input_ids: Full text for Decoder [B, Seq_Dec]
+                                (includes Instruction + Masked Context + Answer)
+            labels: Masked labels for Decoder [B, Seq_Dec]
         """
         device = self.composer.device
-        batch_size = profiler_input_ids.shape[0]
-        embed_fn = self.composer.get_input_embeddings()
 
         # --- [Phase 1] Profiler & Extruder (Compression) ---
+        # 1. Encode with Profiler (Modern-BERT)
         prof_outputs = self.profiler(
-            input_ids=profiler_input_ids.to(device),
-            attention_mask=profiler_attention_mask.to(device),
+            input_ids=profiler_input_ids,
+            attention_mask=profiler_attention_mask,
         )
-        prof_hidden = prof_outputs.last_hidden_state  # [B, Seq_P, D_prof]
+        prof_hidden = prof_outputs.last_hidden_state  # [B, Seq_Enc, D_prof]
 
-        extruded = self.extruder(context=prof_hidden,attn_mask=profiler_attention_mask.to(device))  # [B, N_q, D_prof]
+        # 2. Extrude (Cross-Attention Compression)
+        # Result: [B, Num_Query, D_prof]
+        extruded = self.extruder(context=prof_hidden, attn_mask=profiler_attention_mask)
         extruded = self.post_extruder_norm(extruded)
-        projected = self.projector(extruded)  # [B, N_q, D_comp]
 
-        # Add Separator
-        sep = self.sep_token.expand(batch_size, -1, -1).to(projected.dtype)
-        latents_embeds = torch.cat([projected, sep], dim=1)  # [B, N_q + 1, D_comp]
+        # 3. Project to Composer Dimension
+        # Result: [B, Num_Query, D_comp] aka "Soft Prompts"
+        soft_prompts = self.projector(extruded)
 
-        # ------------------------------------------------------------------
-        # [Phase 2] Construct ChatML Template
-        # Structure: <|im_start|>user\n [Latents] <|im_end|>\n <|im_start|>assistant\n
-        # ------------------------------------------------------------------
+        # --- [Phase 2] Composer Input Injection ---
+        # 1. Get Embeddings of the actual text input (Qwen)
+        # inputs_embeds: [B, Seq_Dec, D_comp]
+        inputs_embeds = self.composer.get_input_embeddings()(composer_input_ids)
 
-        # Embed and expand to batch size
-        prompt_embeds = embed_fn(qwen_prompt_ids.to(device))
-        u_end_emb = embed_fn(self.u_end_ids).expand(batch_size, -1, -1)  # [B, 1, D_comp]
-        a_start_emb = embed_fn(self.a_start_ids).expand(batch_size, -1, -1)  # [B, 1, D_comp]
+        # 2. Prepend Soft Prompts to the text embeddings
+        # Structure: [Soft Prompts] + [Instruction + Masked Context + Answer]
+        # This acts like a "Memory Prefix" or "System Context"
+        final_inputs_embeds = torch.cat([soft_prompts, inputs_embeds], dim=1)
 
-        # 2. Answer Embeddings (Labels)
-        labels = labels.to(device)
-        answer_embeds = embed_fn(labels)  # [B, Ans_Len, D_comp]
+        # --- [Phase 3] Mask & Label Adjustment ---
+        batch_size = soft_prompts.shape[0]
+        prompt_len = soft_prompts.shape[1]
 
-        # --- [Phase 3] Concatenation ---
-        # Qwen sees: [User Start] + [Latents] + [User End] + [Assistant Start] + [Answer]
-        inputs_embeds = torch.cat([prompt_embeds, latents_embeds, u_end_emb, a_start_emb, answer_embeds], dim=1).to(
-            device)
-        prefix_len = prompt_embeds.shape[1] + latents_embeds.shape[1] + u_end_emb.shape[1] + a_start_emb.shape[1]
+        # 1. Extend Attention Mask
+        # Soft prompts should be fully visible (1)
+        prompt_mask = torch.ones((batch_size, prompt_len), device=device, dtype=composer_attention_mask.dtype)
+        final_attention_mask = torch.cat([prompt_mask, composer_attention_mask], dim=1)
 
-        # --- [Phase 4] Masks & Labels ---
-        # 1. Attention Mask
-        inputs_mask = torch.ones((batch_size, prefix_len), device=device,dtype=torch.long)
-        ans_mask = (labels != self.pad_token_id).long()
+        # 2. Extend Labels (if training)
+        if labels is not None:
+            # Soft prompts are not targets, so mask them with -100
+            prompt_labels = torch.full((batch_size, prompt_len), -100, device=device, dtype=labels.dtype)
+            final_labels = torch.cat([prompt_labels, labels], dim=1)
+        else:
+            final_labels = None
 
-        combined_mask = torch.cat([inputs_mask, ans_mask], dim=1)
-
-        # 2. Labels for Loss Calculation
-        # Ignore Prefix (-100)
-        ignore_prefix = torch.full((batch_size, prefix_len), -100, device=device, dtype=labels.dtype)
-
-        labels_padding = labels.clone()
-        labels_padding[labels == self.pad_token_id] = -100
-
-        combined_labels = torch.cat([ignore_prefix, labels_padding], dim=1)
-
-        # --- [Phase 5] Generation / Loss ---
+        # --- [Phase 4] Generation / Loss ---
         outputs = self.composer(
-            inputs_embeds=inputs_embeds,
-            attention_mask=combined_mask,
-            labels=combined_labels
+            inputs_embeds=final_inputs_embeds,
+            attention_mask=final_attention_mask,
+            labels=final_labels
         )
 
         return outputs
