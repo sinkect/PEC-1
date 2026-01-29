@@ -10,3 +10,4 @@ protobuf
 sentencepiece
 hf_transfer
 einops
+spacy
