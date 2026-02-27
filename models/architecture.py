@@ -1,9 +1,23 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
-from .bridge import Extruder, SwiGLU
+from .bridge import Extruder
 
+def _find_multiple(a, b):
+    return (-(a // -b)) * b
+
+class SwiGLU(nn.Module):
+    def __init__(self, hidden_dim: int, expansion: float = 4.0):
+        super().__init__()
+        inter = _find_multiple(round(hidden_dim * expansion * 2 / 3), 256)
+        self.gate_up_proj = nn.Linear(hidden_dim, 2 * inter)
+        self.down_proj = nn.Linear(inter, hidden_dim)
+
+    def forward(self, x):
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 class PECEngine(nn.Module):
     def __init__(
@@ -13,6 +27,7 @@ class PECEngine(nn.Module):
             num_query_tokens=64,
             freeze_profiler=False,
             freeze_composer=True,
+
     ):
         super().__init__()
         current_dir = Path(__file__).parent
@@ -37,8 +52,7 @@ class PECEngine(nn.Module):
         # 4. Bridge Modules
         self.extruder = Extruder(
             hidden_size=self.prof_dim,
-            num_query_tokens=num_query_tokens,
-            max_position_embeddings=self.profiler.config.max_position_embeddings,
+            num_query_tokens=num_query_tokens
         )  # [B, S_doc, D_prof] -> [B, N_q, D_prof]
 
         self.projector = nn.Sequential(
@@ -115,6 +129,7 @@ class PECEngine(nn.Module):
         # 3. Project to Composer Dimension
         # Result: [B, Num_Query, D_comp] aka "Soft Prompts"
         soft_prompts = self.projector(extruded)
+
 
         # --- [Phase 2] Composer Input Injection ---
         # 1. Get Embeddings of the actual text input (Qwen)
