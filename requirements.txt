@@ -11,3 +11,12 @@ sentencepiece
 hf_transfer
 einops
 spacy
+gdown
+datasets
+evaluate
+rouge_score
+bert_score
+absl-py
+nltk
+scikit-learn
+accelerate
