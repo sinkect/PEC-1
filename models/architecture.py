@@ -69,14 +69,6 @@ class PECEngine(nn.Module):
             self.pad_token_id = self.composer.config.eos_token_id
 
 
-        # Prepare special tokens
-        u_end_ids = self.tokenizer("<|im_end|>\n", return_tensors="pt", add_special_tokens=False).input_ids
-        a_start_ids = self.tokenizer("<|im_start|>assistant\n", return_tensors="pt",
-                                     add_special_tokens=False).input_ids
-
-        self.register_buffer("u_end_ids", u_end_ids, persistent=False)
-        self.register_buffer("a_start_ids", a_start_ids, persistent=False)
-
         self._init_weights()
 
     def _init_weights(self):
@@ -123,7 +115,11 @@ class PECEngine(nn.Module):
 
         # 2. Extrude (Cross-Attention Compression)
         # Result: [B, Num_Query, D_prof]
-        extruded = self.extruder(context=prof_hidden, attn_mask=profiler_attention_mask)
+        extruded, gate_scores = self.extruder(
+            context=prof_hidden,
+            attn_mask=profiler_attention_mask,
+            return_gate_scores=True,
+        )
         extruded = self.post_extruder_norm(extruded)
 
         # 3. Project to Composer Dimension
@@ -165,4 +161,8 @@ class PECEngine(nn.Module):
             labels=final_labels
         )
 
-        return outputs
+        return {
+            "loss": outputs.loss,
+            "logits": outputs.logits,
+            "gate_scores": gate_scores,
+        }

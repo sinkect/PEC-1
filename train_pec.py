@@ -1,19 +1,23 @@
-import os
-import random
 from pathlib import Path
 from typing import Dict, Any, List
 
 import torch
-from datasets import load_dataset
+from torch.utils.data import Dataset, Subset
 from transformers import (
     AutoTokenizer,
     TrainingArguments,
-    Trainer,
     EarlyStoppingCallback
 )
 
 from models.architecture import PECEngine
 from models.data import PECDataset, PECCollator, EntityMasker
+from models.dataset_mixing import (
+    load_default_4_4_2_blended_dataset,
+    save_blend_metadata,
+    save_dataset_as_jsonl,
+    save_sampled_by_source_as_jsonl,
+)
+from models.losses import GateL1Trainer
 
 
 def get_device() -> torch.device:
@@ -29,58 +33,45 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def format_hotpotqa(example: Dict[str, Any]) -> Dict[str, str]:
-    """Formats the HotpotQA dataset for the PEC model.
+class BlendedMessagesToPECSamples(Dataset):
+    """Normalizes blended samples into a stable prompt/answer schema."""
 
-    HotpotQA provides a list of contexts (titles and sentences).
-    This function flattens them into a single long context string to simulate
-    a long document retrieval/reasoning scenario.
+    def __init__(self, base_dataset: Dataset):
+        self.base_dataset = base_dataset
 
-    Args:
-        example: Raw example from HotpotQA (distractor configuration).
+    def __len__(self) -> int:
+        return len(self.base_dataset)
 
-    Returns:
-        Dictionary with 'question', 'context', 'answer'.
-    """
-    # 1. Extract raw fields
-    question = example["question"]
-    answer = example["answer"]
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.base_dataset[idx]
+        return {
+            "prompt": str(sample.get("prompt", "")).strip(),
+            "answer": str(sample.get("answer", "")).strip(),
+            "source": sample.get("source", ""),
+        }
 
-    # 2. Flatten Context
-    # HotpotQA context structure:
-    # {
-    #   'title': ['Wiki Title 1', 'Wiki Title 2', ...],
-    #   'sentences': [['Sent 1', 'Sent 2'], ['Sent A', 'Sent B'], ...]
-    # }
-    context_titles = example["context"]["title"]
-    context_sentences = example["context"]["sentences"]
 
-    formatted_context_parts = []
+def split_dataset_indices(dataset_len: int, test_size: float = 0.02, seed: int = 42) -> Dict[str, Subset]:
+    """Creates deterministic train/eval subsets from one dataset."""
+    if not 0.0 < test_size < 1.0:
+        raise ValueError("test_size must be between 0 and 1.")
 
-    for title, sentences in zip(context_titles, context_sentences):
-        # Join sentences into a single paragraph
-        paragraph = "".join(sentences)
-        formatted_context_parts.append(f"Title: {title}\nContent: {paragraph}")
+    eval_len = max(1, int(dataset_len * test_size))
+    train_len = dataset_len - eval_len
 
-    # Join all paragraphs with double newlines
-    full_context = "\n\n".join(formatted_context_parts)
+    if train_len <= 0:
+        raise ValueError("Dataset is too small after applying test_size.")
 
-    # 3. Dynamic Instructions (Reasoning focused)
-    instruction_pool = [
-        "Read the following documents and answer the question using multi-hop reasoning.",
-        "Extract relevant information from the context below to answer the user's query.",
-        "Identify the bridge entities in the documents and deduce the answer.",
-        "Based on the provided wiki passages, answer the question step-by-step.",
-        "Locate the evidence in the text and provide the precise answer.",
-    ]
-
-    selected_instruction = random.choice(instruction_pool)
+    generator = torch.Generator().manual_seed(seed)
+    permutation = torch.randperm(dataset_len, generator=generator).tolist()
+    train_indices = permutation[:train_len]
+    eval_indices = permutation[train_len:]
 
     return {
-        "question": selected_instruction + f"\n\nUser Query: {question}",
-        "context": full_context,
-        "answer": answer,
+        "train": Subset(range(dataset_len), train_indices),
+        "eval": Subset(range(dataset_len), eval_indices),
     }
+
 
 def main():
     """Main entry point for training the PEC model."""
@@ -101,42 +92,80 @@ def main():
     profiler_tokenizer = AutoTokenizer.from_pretrained(profiler_model_path)
     composer_tokenizer = AutoTokenizer.from_pretrained(composer_model_name)
 
-    # 3. Load and Preprocess Dataset
-    print("Loading HotpotQA (distractor) dataset...")
-    raw_dataset = load_dataset("hotpot_qa", "distractor", split="train")
-
-    # Standardize format (rename columns, inject instructions)
-    formatted_dataset = raw_dataset.map(
-        format_case_summary,
-        num_proc=16,
-        remove_columns=raw_dataset.column_names
+    # 3. Load and Preprocess Blended Dataset (4:4:2)
+    print("Loading blended datasets (Open-Platypus, LongMagpie, no_robots)...")
+    blend_result = load_default_4_4_2_blended_dataset(
+        split="train",
+        seed=42,
+        epoch_size=200_000,
+        with_replacement=True,
     )
 
-    # Filter valid examples
-    formatted_dataset = formatted_dataset.filter(lambda x: len(x["context"]) > 100)
+    print(
+        "Blend counts: "
+        f"{dict(zip(blend_result.source_names, blend_result.per_dataset_counts))} "
+        f"(total={blend_result.total_samples})"
+    )
 
-    # Split into Train and Validation sets
-    split_dataset = formatted_dataset.train_test_split(test_size=0.02)
+    pec_ready_dataset = BlendedMessagesToPECSamples(blend_result.dataset)
+
+    split_indices = split_dataset_indices(
+        dataset_len=len(pec_ready_dataset),
+        test_size=0.02,
+        seed=42,
+    )
+
+    train_base = Subset(pec_ready_dataset, split_indices["train"].indices)
+    eval_base = Subset(pec_ready_dataset, split_indices["eval"].indices)
+
+    # Optional: Persist processed datasets for reproducibility and reuse.
+    processed_data_dir = base_dir / "data" / "processed_pec_dataset"
+    save_blend_metadata(blend_result, processed_data_dir / "blend_metadata.json")
+    saved_per_source = save_sampled_by_source_as_jsonl(
+        blend_result.dataset,
+        processed_data_dir / "blended_messages_sampled.jsonl",
+        source_names=blend_result.source_names,
+        samples_per_source=3,
+        seed=42,
+    )
+
+    saved_pec_ready = save_dataset_as_jsonl(
+        pec_ready_dataset,
+        processed_data_dir / "blended_messages_pec_ready.jsonl",
+    )
+
+    print(
+        "Saved sampled conversion-check dataset: "
+        f"counts={saved_per_source} "
+        f"to {processed_data_dir / 'blended_messages_sampled.jsonl'}"
+    )
+    print(
+        "Saved BlendedMessagesToPECSamples result: "
+        f"count={saved_pec_ready} "
+        f"to {processed_data_dir / 'blended_messages_pec_ready.jsonl'}"
+    )
+
 
     # 4. Initialize Dynamic Datasets (The Core of Information Gap Training)
     # We wrap the HF dataset with our custom PECDataset to enable on-the-fly masking.
 
-    # Train set: Apply aggressive masking (40%) to force latent usage.
-    train_context_masker = EntityMasker(mask_prob=0.4)
-    train_query_masker = EntityMasker(mask_prob=0.15)
+    # Train set: Apply masking (30%) to force latent usage.
+    train_query_masker = EntityMasker(mask_prob=0.3)
     train_dataset = PECDataset(
-        data=split_dataset["train"],
-        context_masker=train_context_masker,
-        query_masker=train_query_masker
+        data=train_base,
+        query_masker=train_query_masker,
+        composer_tokenizer=composer_tokenizer,
+        composer_enable_thinking=False,
     )
 
     # Eval set: No masking (or low masking) to evaluate true generation capability.
-    eval_masker = EntityMasker(mask_prob=0.0)
+    eval_masker = EntityMasker(mask_prob=0.15)
 
     eval_dataset = PECDataset(
-        data=split_dataset["test"],
-        context_masker=eval_masker,
-        query_masker=eval_masker
+        data=eval_base,
+        query_masker=eval_masker,
+        composer_tokenizer=composer_tokenizer,
+        composer_enable_thinking=False,
     )
 
     # 5. Initialize PEC Engine
@@ -145,7 +174,6 @@ def main():
         profiler_path=str(profiler_model_path),
         composer_path=composer_model_name
     )
-    model.to(device)
 
     # 6. Initialize Data Collator
     # Handles dual tokenization and label masking for the Composer
@@ -159,23 +187,23 @@ def main():
     # 7. Define Training Arguments
     training_args = TrainingArguments(
         output_dir=str(output_dir),
-        num_train_epochs=5,
+        num_train_epochs=2,
 
         # Batch size configuration
-        per_device_train_batch_size=16,
-        gradient_accumulation_steps=2,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
 
         # Optimization
         learning_rate=5e-4,  # Base learning rate (will be overridden by param groups)
         max_grad_norm=1.0,
-        warmup_ratio=0.1,
+        warmup_steps=100,
         lr_scheduler_type="cosine",
         weight_decay=0.01,
 
         # Mixed Precision
-        fp16=False,
-        bf16=True,
-        tf32=True,
+        fp16=False if get_device() == torch.device("cuda") else True,
+        bf16=True if get_device() == torch.device("cuda") else False,
+        tf32=True if get_device() == torch.device("cuda") else False,
 
         # Logging and Saving
         logging_steps=10,
@@ -183,15 +211,16 @@ def main():
         eval_strategy="steps",
         eval_steps=500,
         save_strategy="steps",
-        save_steps=500  ,
+        save_steps=500,
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="loss",
 
         # Dataloader
-        dataloader_num_workers=16,
-        dataloader_pin_memory=True,
-        remove_unused_columns=False  # Important for custom datasets
+        dataloader_num_workers=8 if get_device() == torch.device("cuda") else 0,
+        dataloader_pin_memory=True if get_device() == torch.device("cuda") else False,
+        remove_unused_columns=False,  # Important for custom datasets
+
     )
 
     # 8. Define Optimizer Groups (Differential Learning Rates)
@@ -206,20 +235,22 @@ def main():
             "params": [p for n, p in model.named_parameters() if
                        ("extruder" in n or "projector" in n) and p.requires_grad],
             "lr": 5e-4,
-        },
-
+        }
     ]
 
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
 
     # 9. Initialize Trainer
-    trainer = Trainer(
+    trainer = GateL1Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         optimizers=(optimizer, None),
+        gate_l1_max_lambda=1e-3,
+        gate_l1_warmup_ratio=0.1,
+
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
     )
 

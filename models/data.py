@@ -1,5 +1,6 @@
 import random
-from typing import List, Dict, Any, Tuple
+from operator import xor
+from typing import Any, Dict, List, Optional
 import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
@@ -45,21 +46,37 @@ class PECDataset(Dataset):
     2. Noisy Stream (for Composer): Masked text and Instructions for generation.
     """
 
-    def __init__(self, data: List[Dict[str, str]], context_masker: EntityMasker, query_masker: EntityMasker):
+    def __init__(
+            self,
+            data: List[Dict[str, Any]],
+            query_masker: EntityMasker,
+            composer_tokenizer: Optional[PreTrainedTokenizer] = None,
+            composer_enable_thinking: bool = False,
+    ):
         """Initializes the PEC dataset.
 
         Args:
-            data: List of dicts with 'question', 'context', 'answer'.
-            context_masker: EntityMasker instance to corrupt context for the Composer.
-            query_masker: EntityMasker instance to corrupt query for the Composer.
+            data: List of dicts with 'prompt' (or 'input') and 'answer'.
+            query_masker: EntityMasker instance to corrupt prompt for the Composer.
+            composer_tokenizer: Optional tokenizer to render Qwen chat templates.
+            composer_enable_thinking: Whether to enable Qwen thinking mode.
         """
         self.data = data
-        self.context_masker = context_masker
         self.query_masker = query_masker
-
-        # Qwen-based Composer Chat Template
-        self.user_format = "<|im_start|>user\n{query}\n\nContext:\n{context}<|im_end|>\n<|im_start|>assistant\n"
+        self.composer_tokenizer = composer_tokenizer
+        self.composer_enable_thinking = composer_enable_thinking
         self.eos_token = "<|im_end|>"
+
+    def _render_qwen_chat(self, messages: List[Dict[str, str]], add_generation_prompt: bool) -> str:
+        if self.composer_tokenizer is None:
+            raise ValueError("composer_tokenizer is required to render Qwen chat template.")
+
+        return self.composer_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking= self.composer_enable_thinking
+        )
 
     def __len__(self) -> int:
         return len(self.data)
@@ -74,22 +91,27 @@ class PECDataset(Dataset):
             - 'composer_full_text': Full sequence for the Composer (Qwen).
         """
         item = self.data[idx]
-        query = item.get('question', '')
-        context = item.get('context', '')
-        answer = item.get('answer', '')
+        prompt = str(item.get("prompt", item.get("input", ""))).strip()
+        answer = str(item.get("answer", "")).strip()
 
-        # 1. Input for Profiler (Clean Context)
+        # 1. Input for Profiler (Clean Prompt)
         # The Profiler needs full visibility to generate accurate latent vectors.
-        profiler_input_text = f"Question: {query} Context: {context}"
+        profiler_input_text = prompt
 
-        # 2. Input for Composer (Corrupted Context via Masking)
-        # The Composer receives masked context to force reliance on the Extruder's output.
-        masked_context = self.context_masker(context)
+        # 2. Input for Composer (Corrupted Prompt via Masking)
+        masked_prompt = self.query_masker(prompt)
 
-        masked_query = self.query_masker(query)
-
-        composer_prompt_text = self.user_format.format(query=masked_query, context=masked_context)
-        composer_full_text = composer_prompt_text + answer + self.eos_token
+        if self.composer_tokenizer is not None:
+            prompt_messages = [{"role": "user", "content": masked_prompt}]
+            full_messages = [
+                {"role": "user", "content": masked_prompt},
+                {"role": "assistant", "content": answer},
+            ]
+            composer_prompt_text = self._render_qwen_chat(prompt_messages,add_generation_prompt=True)
+            composer_full_text = self._render_qwen_chat(full_messages,add_generation_prompt=False)
+        else:
+            composer_prompt_text = f"{masked_prompt}\n"
+            composer_full_text = composer_prompt_text + answer + self.eos_token
 
         return {
             "profiler_input_text": profiler_input_text,
