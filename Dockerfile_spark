@@ -1,0 +1,22 @@
+# Base image with ARM64 architecture, PyTorch 2.10, CUDA 13.0, and Python 3.12
+FROM --platform=linux/arm64 nvcr.io/nvidia/pytorch:25.11-py3
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Update apt and install virtual environment tools
+RUN apt-get update && \
+    apt-get install -y python3-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy dependencies
+COPY requirements.txt /tmp/requirements.txt
+
+# Install Flash Attention tailored for ARM64 and specific PyTorch/CUDA versions
+RUN pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_aarch64.whl
+
+# Install other requirements without build isolation
+RUN pip install -r /tmp/requirements.txt --no-build-isolation
+
+# Download SpaCy english language model
+RUN python -m spacy download en_core_web_sm
