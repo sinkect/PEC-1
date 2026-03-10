@@ -1,0 +1,13 @@
+FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-devel
+
+RUN apt-get update && \
+    apt-get install -y python3.12-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+COPY requirements.txt /tmp/requirements.txt
+
+RUN pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl
+RUN pip install -r /tmp/requirements.txt --no-build-isolation
+RUN python -m spacy download en_core_web_sm
