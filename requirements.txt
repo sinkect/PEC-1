@@ -19,3 +19,5 @@ absl-py
 nltk
 scikit-learn
 accelerate
+setproctitle
+tqdm
