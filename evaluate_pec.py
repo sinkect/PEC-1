@@ -10,7 +10,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
-import setproctitle
+try:
+    import setproctitle
+except ModuleNotFoundError:
+    setproctitle = None
 
 from tqdm.auto import tqdm
 
@@ -418,17 +421,11 @@ def generate_pec_responses(
     )
     composer_inputs = move_tokenized_batch(composer_inputs, device)
 
-    prof_outputs = model.profiler(
-        input_ids=profiler_inputs["input_ids"],
-        attention_mask=profiler_inputs["attention_mask"],
-    )
-    prof_hidden = prof_outputs.last_hidden_state
-    extruded, gate_scores = model.extruder(
-        context=prof_hidden,
-        attn_mask=profiler_inputs["attention_mask"],
+    soft_prompts, gate_scores = model.encode_soft_prompts(
+        profiler_input_ids=profiler_inputs["input_ids"],
+        profiler_attention_mask=profiler_inputs["attention_mask"],
         return_gate_scores=True,
     )
-    soft_prompts = model.projector(model.post_extruder_norm(extruded))
 
     text_embeds = model.composer.get_input_embeddings()(composer_inputs["input_ids"])
     final_inputs_embeds = torch.cat([soft_prompts, text_embeds], dim=1)
@@ -529,7 +526,7 @@ def load_base_model(model_name: str, device: torch.device, dtype: torch.dtype):
 def load_pec_model(
     *,
     checkpoint_dir: Path,
-    profiler_path: Path,
+    profiler_path: str | Path,
     composer_model_name: str,
     num_query_tokens: int,
     device: torch.device,
@@ -549,9 +546,11 @@ def load_pec_model(
     if unexpected_keys:
         raise RuntimeError(f"Unexpected keys in PEC checkpoint: {unexpected_keys}")
 
+    dynamic_query_prefixes = ("extruder.delta_mlp", "extruder.gate_mlp")
     critical_missing = [
         key for key in missing_keys
         if key.startswith(("extruder", "projector", "post_extruder_norm"))
+        and not key.startswith(dynamic_query_prefixes)
     ]
     if critical_missing:
         raise RuntimeError(f"Critical PEC weights are missing from checkpoint: {critical_missing}")
@@ -568,6 +567,12 @@ def build_re2_job_name(job: Dict[str, Any]) -> str:
     )
 
 
+def describe_decoding_mode(*, do_sample: bool, enable_thinking: bool) -> str:
+    mode = "sampling" if do_sample else "greedy"
+    thinking = "thinking_on" if enable_thinking else "thinking_off"
+    return f"{mode}/{thinking}"
+
+
 def build_re2_prediction_record(
     *,
     dataset_name: str,
@@ -582,14 +587,24 @@ def build_re2_prediction_record(
     gate_stats: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
     cleaned_prediction = strip_thinking_trace(raw_prediction)
-    parsed_prediction = parse_re2_answer(
+    strict_parsed_prediction = parse_re2_answer(
         cleaned_prediction,
         dataset_name,
         example,
         act=act,
+        mode="strict",
     )
-    score = score_re2_prediction(dataset_name, parsed_prediction, example)
+    relaxed_parsed_prediction = parse_re2_answer(
+        cleaned_prediction,
+        dataset_name,
+        example,
+        act=act,
+        mode="relaxed",
+    )
+    strict_score = score_re2_prediction(dataset_name, strict_parsed_prediction, example)
+    relaxed_score = score_re2_prediction(dataset_name, relaxed_parsed_prediction, example)
     config = get_dataset_config(dataset_name)
+    expects_box = act != "pal"
     record = {
         "sample_index": sample_index,
         "example_id": get_example_id(example, sample_index),
@@ -604,10 +619,14 @@ def build_re2_prediction_record(
         "input_prompt": input_prompt,
         "reference": get_reference_answer_text(example, dataset_name),
         "prediction_text": cleaned_prediction,
-        "parsed_prediction": parsed_prediction,
+        "strict_parsed_prediction": strict_parsed_prediction,
+        "relaxed_parsed_prediction": relaxed_parsed_prediction,
+        "parsed_prediction": relaxed_parsed_prediction,
         "raw_prediction": raw_prediction,
-        "score": int(score),
-        "no_boxed": int(bool(raw_prediction) and "boxed" not in raw_prediction.lower()),
+        "strict_score": int(strict_score),
+        "relaxed_score": int(relaxed_score),
+        "score": int(relaxed_score),
+        "no_boxed": int(expects_box and bool(raw_prediction) and "boxed" not in raw_prediction.lower()),
     }
     if gate_stats is not None:
         record.update(gate_stats)
@@ -634,6 +653,8 @@ def evaluate_base_re2_benchmark(
         f"\n[RE2/Base] dataset={dataset_name} act={act} read_times={read_times} model={model_name}",
         flush=True,
     )
+    print(f"  Decoding: {describe_decoding_mode(do_sample=do_sample, enable_thinking=enable_thinking)}", flush=True)
+    print(f"  Batch size: {batch_size}", flush=True)
     model, tokenizer = load_base_model(model_name, device, dtype)
     predictions: List[Dict[str, Any]] = []
     preview_printed = 0
@@ -741,7 +762,7 @@ def evaluate_pec_re2_benchmark(
     output_dir: Path,
     device: torch.device,
     checkpoint_dir: Path,
-    profiler_path: Path,
+    profiler_path: str | Path,
     composer_model_name: str,
     num_query_tokens: int,
     max_profiler_len: int,
@@ -756,6 +777,8 @@ def evaluate_pec_re2_benchmark(
         f"\n[RE2/PEC] dataset={dataset_name} act={act} read_times={read_times} model={composer_model_name}",
         flush=True,
     )
+    print(f"  Decoding: {describe_decoding_mode(do_sample=do_sample, enable_thinking=enable_thinking)}", flush=True)
+    print(f"  Batch size: {batch_size}", flush=True)
     model, profiler_tokenizer, composer_tokenizer = load_pec_model(
         checkpoint_dir=checkpoint_dir,
         profiler_path=profiler_path,
@@ -920,6 +943,205 @@ def build_re2_jobs(args: argparse.Namespace) -> List[Dict[str, Any]]:
     return jobs
 
 
+def build_re2_worker_command(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    eval_samples_path: Path,
+    job: Dict[str, Any],
+    summary_path: Path,
+) -> List[str]:
+    command = [
+        sys.executable,
+        "-u",
+        str(Path(__file__).resolve()),
+        "--protocol",
+        "re2_paper",
+        "--run-dir",
+        str(run_dir),
+        "--eval-samples-jsonl",
+        str(eval_samples_path),
+        "--batch-size",
+        str(args.batch_size),
+        "--preview-samples",
+        str(args.preview_samples),
+        "--benchmark-data-dir",
+        str(args.benchmark_data_dir),
+        "--pec-checkpoint-dir",
+        str(args.pec_checkpoint_dir),
+        "--profiler-path",
+        str(args.profiler_path),
+        "--pec-composer-model",
+        args.pec_composer_model,
+        "--num-query-tokens",
+        str(args.num_query_tokens),
+        "--max-profiler-len",
+        str(args.max_profiler_len),
+        "--max-composer-len",
+        str(args.max_composer_len),
+        "--max-new-tokens",
+        str(args.max_new_tokens),
+        "--worker-kind",
+        job["kind"],
+        "--worker-protocol",
+        "re2_paper",
+        "--worker-dataset-name",
+        job["dataset_name"],
+        "--worker-act",
+        job["act"],
+        "--worker-read-times",
+        str(job["read_times"]),
+        "--worker-summary-path",
+        str(summary_path),
+    ]
+
+    command.append("--do-sample" if args.do_sample else "--no-sample")
+    command.append("--enable-thinking" if args.enable_thinking else "--disable-thinking")
+
+    if job["kind"] == "base":
+        command.extend(["--worker-model-name", job["model_name"]])
+
+    return command
+
+
+def run_parallel_re2_jobs(
+    *,
+    jobs: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+    run_dir: Path,
+    benchmark_collections: Dict[str, List[Dict[str, Any]]],
+    gpu_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    dataset_payload_dir = run_dir / "benchmark_payloads"
+    logs_dir = run_dir / "logs"
+    worker_summary_dir = run_dir / "worker_summaries"
+    dataset_payload_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    worker_summary_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset_payload_paths: Dict[str, Path] = {}
+    for dataset_name, samples in benchmark_collections.items():
+        payload_path = dataset_payload_dir / f"{dataset_name}.jsonl"
+        write_jsonl(samples, payload_path)
+        dataset_payload_paths[dataset_name] = payload_path
+
+    completed_summaries: List[Tuple[int, Dict[str, Any]]] = []
+    pending_jobs: List[Tuple[int, Dict[str, Any]]] = []
+    for job_index, job in enumerate(jobs):
+        summary_path = worker_summary_dir / f"{build_re2_job_name(job)}.json"
+        if summary_path.exists():
+            completed_summaries.append((job_index, json.loads(summary_path.read_text(encoding="utf-8"))))
+        else:
+            pending_jobs.append((job_index, job))
+
+    running_jobs: Dict[int, Dict[str, Any]] = {}
+
+    print(f"Running {len(jobs)} RE2 benchmark jobs across GPUs {list(gpu_ids)}", flush=True)
+    print(f"Worker logs: {logs_dir}", flush=True)
+    if completed_summaries:
+        print(f"Resuming existing run: {len(completed_summaries)} jobs already completed, {len(pending_jobs)} remaining", flush=True)
+
+    try:
+        while pending_jobs or running_jobs:
+            available_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id not in running_jobs]
+            while available_gpu_ids and pending_jobs:
+                gpu_id = available_gpu_ids.pop(0)
+                job_index, job = pending_jobs.pop(0)
+                job_name = build_re2_job_name(job)
+                log_path = logs_dir / f"{job_name}.log"
+                summary_path = worker_summary_dir / f"{job_name}.json"
+                worker_command = build_re2_worker_command(
+                    args=args,
+                    run_dir=run_dir,
+                    eval_samples_path=dataset_payload_paths[job["dataset_name"]],
+                    job=job,
+                    summary_path=summary_path,
+                )
+                log_handle = log_path.open("w", encoding="utf-8", buffering=1)
+                worker_env = os.environ.copy()
+                worker_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                worker_env["PYTHONUNBUFFERED"] = "1"
+
+                print(
+                    f"  - launching [{job_index + 1}/{len(jobs)}] {job_name} on GPU {gpu_id} -> {log_path}",
+                    flush=True,
+                )
+                process = subprocess.Popen(
+                    worker_command,
+                    cwd=Path(__file__).parent,
+                    env=worker_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                stream_thread = threading.Thread(
+                    target=stream_worker_output,
+                    kwargs={
+                        "process": process,
+                        "log_handle": log_handle,
+                        "prefix": f"gpu{gpu_id}:{job_name}",
+                    },
+                    daemon=True,
+                )
+                stream_thread.start()
+                running_jobs[gpu_id] = {
+                    "job_index": job_index,
+                    "job_name": job_name,
+                    "log_path": log_path,
+                    "log_handle": log_handle,
+                    "process": process,
+                    "summary_path": summary_path,
+                    "stream_thread": stream_thread,
+                }
+
+            finished_gpu_ids: List[int] = []
+            for gpu_id, job_state in running_jobs.items():
+                process = job_state["process"]
+                return_code = process.poll()
+                if return_code is None:
+                    continue
+
+                if process.stdout is not None:
+                    process.stdout.close()
+                job_state["stream_thread"].join(timeout=5)
+                job_state["log_handle"].close()
+                if return_code != 0:
+                    raise RuntimeError(
+                        f"RE2 eval worker failed for {job_state['job_name']} on GPU {gpu_id}. "
+                        f"See {job_state['log_path']}"
+                    )
+
+                summary = json.loads(job_state["summary_path"].read_text(encoding="utf-8"))
+                completed_summaries.append((job_state["job_index"], summary))
+                finished_gpu_ids.append(gpu_id)
+                print(f"  - finished {job_state['job_name']} on GPU {gpu_id}", flush=True)
+
+            for gpu_id in finished_gpu_ids:
+                del running_jobs[gpu_id]
+
+            if running_jobs:
+                print(
+                    f"  - progress: {len(completed_summaries)}/{len(jobs)} jobs finished, "
+                    f"{len(running_jobs)} running, {len(pending_jobs)} pending",
+                    flush=True,
+                )
+                time.sleep(5)
+    except Exception:
+        for job_state in running_jobs.values():
+            process = job_state["process"]
+            if process.poll() is None:
+                process.terminate()
+            if process.stdout is not None:
+                process.stdout.close()
+            job_state["stream_thread"].join(timeout=5)
+            job_state["log_handle"].close()
+        raise
+
+    completed_summaries.sort(key=lambda item: item[0])
+    return [summary for _, summary in completed_summaries]
+
+
 def run_re2_paper_protocol(args: argparse.Namespace) -> None:
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
@@ -938,7 +1160,11 @@ def run_re2_paper_protocol(args: argparse.Namespace) -> None:
     print(f"Device={device}, dtype={dtype}", flush=True)
     benchmark_collections = load_re2_benchmark_collections(args)
     jobs = build_re2_jobs(args)
+    gpu_ids = resolve_gpu_ids(args)
+    if len(gpu_ids) != len(set(gpu_ids)):
+        raise ValueError("--gpu-ids must not contain duplicates")
     print(f"Prepared {len(jobs)} benchmark jobs", flush=True)
+    print(f"Decoding mode: {describe_decoding_mode(do_sample=args.do_sample, enable_thinking=args.enable_thinking)}", flush=True)
 
     config_payload = {
         "protocol": "re2_paper",
@@ -954,23 +1180,45 @@ def run_re2_paper_protocol(args: argparse.Namespace) -> None:
         "base_models": list(args.base_models),
         "skip_base": bool(args.skip_base),
         "skip_pec": bool(args.skip_pec),
+        "gpu_ids": gpu_ids,
+        "num_eval_jobs": len(jobs),
         "pec_composer_model": args.pec_composer_model,
         "num_query_tokens": args.num_query_tokens,
         "max_new_tokens": args.max_new_tokens,
         "do_sample": bool(args.do_sample),
+        "enable_thinking": bool(args.enable_thinking),
         "decoding_note": "Paper Table 1/2 uses zero-shot greedy decoding with temperature=0. This protocol defaults to greedy decoding and boxed-answer extraction.",
     }
     (run_dir / "run_config.json").write_text(
         json.dumps(config_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    worker_summary_dir = run_dir / "worker_summaries"
+    worker_summary_dir.mkdir(parents=True, exist_ok=True)
 
-    summaries: List[Dict[str, Any]] = []
-    for job in jobs:
-        examples = benchmark_collections[job["dataset_name"]]
-        if job["kind"] == "base":
-            summaries.append(
-                evaluate_base_re2_benchmark(
+    if device.type == "cuda" and len(gpu_ids) > 1 and len(jobs) > 1:
+        summaries = run_parallel_re2_jobs(
+            jobs=jobs,
+            args=args,
+            run_dir=run_dir,
+            benchmark_collections=benchmark_collections,
+            gpu_ids=gpu_ids,
+        )
+    else:
+        summaries = []
+        for job_index, job in enumerate(jobs, start=1):
+            summary_path = worker_summary_dir / f"{build_re2_job_name(job)}.json"
+            if summary_path.exists():
+                print(f"[Job {job_index}/{len(jobs)}] skipping completed {build_re2_job_name(job)}", flush=True)
+                summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
+                continue
+            print(
+                f"[Job {job_index}/{len(jobs)}] {build_re2_job_name(job)}",
+                flush=True,
+            )
+            examples = benchmark_collections[job["dataset_name"]]
+            if job["kind"] == "base":
+                summary = evaluate_base_re2_benchmark(
                     dataset_name=job["dataset_name"],
                     model_name=job["model_name"],
                     act=job["act"],
@@ -985,10 +1233,8 @@ def run_re2_paper_protocol(args: argparse.Namespace) -> None:
                     do_sample=args.do_sample,
                     enable_thinking=args.enable_thinking,
                 )
-            )
-        else:
-            summaries.append(
-                evaluate_pec_re2_benchmark(
+            else:
+                summary = evaluate_pec_re2_benchmark(
                     dataset_name=job["dataset_name"],
                     act=job["act"],
                     read_times=job["read_times"],
@@ -1007,7 +1253,8 @@ def run_re2_paper_protocol(args: argparse.Namespace) -> None:
                     do_sample=args.do_sample,
                     enable_thinking=args.enable_thinking,
                 )
-            )
+            summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            summaries.append(summary)
 
     summaries.extend(build_arc_total_summary(summaries))
     write_summary_csv(summaries, run_dir / "summary.csv")
@@ -1141,7 +1388,7 @@ def evaluate_pec_experiment(
     output_dir: Path,
     device: torch.device,
     checkpoint_dir: Path,
-    profiler_path: Path,
+    profiler_path: str | Path,
     composer_model_name: str,
     num_query_tokens: int,
     mask_probability: float,
@@ -1659,13 +1906,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--pec-checkpoint-dir", type=Path, default=base_dir / "models" / "PEC")
-    parser.add_argument("--profiler-path", type=Path, default=base_dir / "models" / "profiler")
+    parser.add_argument("--profiler-path", type=str, default="answerdotai/ModernBERT-base")
     parser.add_argument("--pec-composer-model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--num-query-tokens", type=int, default=64)
     parser.add_argument("--mask-probability", type=float, default=0.3)
     parser.add_argument("--mask-seed", type=int, default=42)
-    parser.add_argument("--max-profiler-len", type=int, default=8192)
-    parser.add_argument("--max-composer-len", type=int, default=4096)
+    parser.add_argument("--max-profiler-len", type=int, default=6144)
+    parser.add_argument("--max-composer-len", type=int, default=6080)
 
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument(
@@ -1709,8 +1956,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--eval-samples-jsonl", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-kind", choices=["base", "pec"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-protocol", choices=["re2_paper", "heldout_pec"], default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-model-name", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-prompt-repeat-count", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-dataset-name", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-act", choices=["vanilla", "cot", "ps", "pal"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-read-times", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument(
         "--worker-scenario",
         choices=["base_no_hint", "base_prompt_twice", "pec_with_hint", "pec_masked_hint"],
@@ -1724,35 +1975,80 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.protocol == "re2_paper":
-        run_re2_paper_protocol(args)
-        return
-
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be at least 1")
-    if args.preview_samples < 0:
-        raise ValueError("--preview-samples must be at least 0")
-    if args.worker_prompt_repeat_count < 1:
-        raise ValueError("--worker-prompt-repeat-count must be at least 1")
-
     if args.worker_kind is not None:
         if args.run_dir is None:
             raise ValueError("--run-dir is required in worker mode")
-        if args.worker_thinking_mode is None:
-            raise ValueError("--worker-thinking-mode is required in worker mode")
         if args.worker_summary_path is None:
             raise ValueError("--worker-summary-path is required in worker mode")
+        if args.eval_samples_jsonl is None:
+            raise ValueError("--eval-samples-jsonl is required in worker mode")
 
-    run_dir = args.run_dir or (args.output_dir / time.strftime("%Y%m%d-%H%M%S"))
-    run_dir.mkdir(parents=True, exist_ok=True)
+        worker_protocol = args.worker_protocol or args.protocol
+        device = get_device()
+        dtype = get_inference_dtype(device)
+        print(f"Device={device}, dtype={dtype}", flush=True)
 
-    device = get_device()
-    dtype = get_inference_dtype(device)
-    print(f"Device={device}, dtype={dtype}", flush=True)
-    eval_samples = load_eval_samples(args)
-    print(f"Loaded held-out eval samples: {len(eval_samples)}", flush=True)
+        if worker_protocol == "re2_paper":
+            if args.worker_dataset_name is None:
+                raise ValueError("--worker-dataset-name is required for RE2 worker jobs")
+            if args.worker_act is None:
+                raise ValueError("--worker-act is required for RE2 worker jobs")
+            if args.worker_read_times < 1:
+                raise ValueError("--worker-read-times must be at least 1")
 
-    if args.worker_kind is not None:
+            eval_samples = read_jsonl(args.eval_samples_jsonl)
+            print(f"Loaded RE2 worker samples: {len(eval_samples)}", flush=True)
+            if args.worker_kind == "base":
+                if args.worker_model_name is None:
+                    raise ValueError("--worker-model-name is required for RE2 base worker jobs")
+                summary = evaluate_base_re2_benchmark(
+                    dataset_name=args.worker_dataset_name,
+                    model_name=args.worker_model_name,
+                    act=args.worker_act,
+                    read_times=args.worker_read_times,
+                    examples=eval_samples,
+                    output_dir=args.run_dir,
+                    device=device,
+                    dtype=dtype,
+                    batch_size=args.batch_size,
+                    preview_samples=args.preview_samples,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=args.do_sample,
+                    enable_thinking=args.enable_thinking,
+                )
+            else:
+                summary = evaluate_pec_re2_benchmark(
+                    dataset_name=args.worker_dataset_name,
+                    act=args.worker_act,
+                    read_times=args.worker_read_times,
+                    examples=eval_samples,
+                    output_dir=args.run_dir,
+                    device=device,
+                    checkpoint_dir=args.pec_checkpoint_dir,
+                    profiler_path=args.profiler_path,
+                    composer_model_name=args.pec_composer_model,
+                    num_query_tokens=args.num_query_tokens,
+                    max_profiler_len=args.max_profiler_len,
+                    max_composer_len=args.max_composer_len,
+                    batch_size=args.batch_size,
+                    preview_samples=args.preview_samples,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=args.do_sample,
+                    enable_thinking=args.enable_thinking,
+                )
+            args.worker_summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"Worker finished: {build_re2_job_name(summary)}", flush=True)
+            return
+
+        if args.worker_prompt_repeat_count < 1:
+            raise ValueError("--worker-prompt-repeat-count must be at least 1")
+        if args.worker_thinking_mode is None:
+            raise ValueError("--worker-thinking-mode is required in worker mode")
+
+        run_dir = args.run_dir
+        run_dir.mkdir(parents=True, exist_ok=True)
+        eval_samples = load_eval_samples(args)
+        print(f"Loaded held-out eval samples: {len(eval_samples)}", flush=True)
         worker_job = {
             "kind": args.worker_kind,
             "model_name": args.worker_model_name or args.pec_composer_model,
@@ -1779,6 +2075,26 @@ def main() -> None:
         args.worker_summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Worker finished: {eval_job_name(worker_job)}", flush=True)
         return
+
+    if args.protocol == "re2_paper":
+        run_re2_paper_protocol(args)
+        return
+
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.preview_samples < 0:
+        raise ValueError("--preview-samples must be at least 0")
+    if args.worker_prompt_repeat_count < 1:
+        raise ValueError("--worker-prompt-repeat-count must be at least 1")
+
+    run_dir = args.run_dir or (args.output_dir / time.strftime("%Y%m%d-%H%M%S"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    device = get_device()
+    dtype = get_inference_dtype(device)
+    print(f"Device={device}, dtype={dtype}", flush=True)
+    eval_samples = load_eval_samples(args)
+    print(f"Loaded held-out eval samples: {len(eval_samples)}", flush=True)
 
     thinking_modes = [mode == "on" for mode in args.thinking_modes]
     jobs = build_eval_jobs(

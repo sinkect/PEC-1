@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from torch.utils.data import ConcatDataset, Dataset, Subset
 from datasets import Dataset as HFDataset
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
-from torch.utils.data import ConcatDataset, Dataset, Subset
+
 
 
 PromptAnswerSample = Dict[str, str]
@@ -69,9 +71,13 @@ class HFDatasetAdapter(Dataset):
 def format_open_platypus(sample: Dict[str, Any]) -> PromptAnswerSample:
     """Formats one Open-Platypus row into prompt/answer fields."""
     instruction = str(sample.get("instruction", "")).strip()
+    input_text = str(sample.get("input", "")).strip()
     answer = str(sample.get("output", "")).strip()
 
-    return {"prompt": instruction, "answer": answer}
+    prompt = instruction
+    if input_text:
+        prompt = f"{instruction}\n\nInput:\n{input_text}" if instruction else input_text
+    return {"prompt": prompt, "answer": answer}
 
 
 def format_long_magpie(sample: Dict[str, Any]) -> PromptAnswerSample:
@@ -90,32 +96,143 @@ def _estimate_word_length(prompt_answer: PromptAnswerSample) -> int:
     return len(total_text.split())
 
 
+def _build_qwen_training_text(composer_tokenizer, prompt: str, answer: str) -> str:
+    return composer_tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": answer},
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=False,
+    )
+
+
+@lru_cache(maxsize=4)
+def _get_long_context_filter_tokenizers(
+    profiler_tokenizer_name: str = "answerdotai/ModernBERT-base",
+    composer_tokenizer_name: str = "Qwen/Qwen3-1.7B",
+):
+    from transformers import AutoTokenizer
+
+    profiler_tokenizer = AutoTokenizer.from_pretrained(profiler_tokenizer_name)
+    composer_tokenizer = AutoTokenizer.from_pretrained(composer_tokenizer_name)
+    if composer_tokenizer.pad_token_id is None:
+        composer_tokenizer.pad_token = composer_tokenizer.eos_token
+    return profiler_tokenizer, composer_tokenizer
+
+
+def is_prompt_answer_within_token_limits(
+    prompt_answer: PromptAnswerSample,
+    *,
+    profiler_tokenizer,
+    composer_tokenizer,
+    max_profiler_tokens: int = 6080,
+    max_composer_tokens: int = 6080,
+) -> bool:
+    prompt = str(prompt_answer.get("prompt", "")).strip()
+    answer = str(prompt_answer.get("answer", "")).strip()
+    if not prompt and not answer:
+        return False
+
+    profiler_tokens = profiler_tokenizer(prompt, add_special_tokens=True, truncation=False)["input_ids"]
+    if len(profiler_tokens) > max_profiler_tokens:
+        return False
+
+    composer_full_text = _build_qwen_training_text(composer_tokenizer, prompt, answer)
+    composer_tokens = composer_tokenizer(
+        composer_full_text,
+        add_special_tokens=False,
+        truncation=False,
+    )["input_ids"]
+    return len(composer_tokens) <= max_composer_tokens
+
+
+def _normalize_batch_slice(batch: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    keys = list(batch.keys())
+    if not keys:
+        return []
+    batch_size = len(batch[keys[0]])
+    return [{key: batch[key][index] for key in keys} for index in range(batch_size)]
+
+
 def is_within_long_context_limit(
     sample: Dict[str, Any],
     *,
-    max_word_estimate: int = 6000,
+    max_profiler_tokens: int = 6080,
+    max_composer_tokens: int = 6080,
+    profiler_tokenizer_name: str = "answerdotai/ModernBERT-base",
+    composer_tokenizer_name: str = "Qwen/Qwen3-1.7B",
 ) -> bool:
-    """Returns True when a LongMagpie sample is safely under the context budget.
-
-    The heuristic `max_word_estimate=6000` is used to stay below an 8k-token
-    model limit with margin.
-    """
+    """Returns True when a LongMagpie sample fits the actual tokenizer budgets."""
     prompt_answer = format_long_magpie(sample)
-    if not prompt_answer.get("prompt") and not prompt_answer.get("answer"):
-        return False
-    return _estimate_word_length(prompt_answer) <= max_word_estimate
+    profiler_tokenizer, composer_tokenizer = _get_long_context_filter_tokenizers(
+        profiler_tokenizer_name=profiler_tokenizer_name,
+        composer_tokenizer_name=composer_tokenizer_name,
+    )
+    return is_prompt_answer_within_token_limits(
+        prompt_answer,
+        profiler_tokenizer=profiler_tokenizer,
+        composer_tokenizer=composer_tokenizer,
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
+    )
 
 
 def build_long_magpie_subset_with_length_limit(
     dataset: HFDataset,
     *,
-    max_word_estimate: int = 6000,
+    max_profiler_tokens: int = 6080,
+    max_composer_tokens: int = 6080,
+    profiler_tokenizer_name: str = "answerdotai/ModernBERT-base",
+    composer_tokenizer_name: str = "Qwen/Qwen3-1.7B",
+    batch_size: int = 256,
 ) -> Subset:
-    """Builds a deterministic subset of LongMagpie samples under length limit."""
+    """Builds a deterministic subset of LongMagpie samples under tokenizer budgets."""
+    profiler_tokenizer, composer_tokenizer = _get_long_context_filter_tokenizers(
+        profiler_tokenizer_name=profiler_tokenizer_name,
+        composer_tokenizer_name=composer_tokenizer_name,
+    )
     kept_indices: List[int] = []
-    for index in range(len(dataset)):
-        if is_within_long_context_limit(dataset[index], max_word_estimate=max_word_estimate):
-            kept_indices.append(index)
+    for start in range(0, len(dataset), batch_size):
+        batch = _normalize_batch_slice(dataset[start:start + batch_size])
+        prompt_answers = [format_long_magpie(sample) for sample in batch]
+        prompts = [str(sample.get("prompt", "")).strip() for sample in prompt_answers]
+        answers = [str(sample.get("answer", "")).strip() for sample in prompt_answers]
+
+        profiler_lengths = [0] * len(prompt_answers)
+        composer_lengths = [0] * len(prompt_answers)
+        non_empty_indices = [index for index, (prompt, answer) in enumerate(zip(prompts, answers)) if prompt or answer]
+
+        if non_empty_indices:
+            filtered_prompts = [prompts[index] for index in non_empty_indices]
+            filtered_answers = [answers[index] for index in non_empty_indices]
+            profiler_batches = profiler_tokenizer(
+                filtered_prompts,
+                add_special_tokens=True,
+                padding=False,
+                truncation=False,
+            )["input_ids"]
+            composer_full_texts = [
+                _build_qwen_training_text(composer_tokenizer, prompt, answer)
+                for prompt, answer in zip(filtered_prompts, filtered_answers)
+            ]
+            composer_batches = composer_tokenizer(
+                composer_full_texts,
+                add_special_tokens=False,
+                padding=False,
+                truncation=False,
+            )["input_ids"]
+
+            for local_index, profiler_ids, composer_ids in zip(non_empty_indices, profiler_batches, composer_batches):
+                profiler_lengths[local_index] = len(profiler_ids)
+                composer_lengths[local_index] = len(composer_ids)
+
+        for offset, prompt_answer in enumerate(prompt_answers):
+            if not prompts[offset] and not answers[offset]:
+                continue
+            if profiler_lengths[offset] <= max_profiler_tokens and composer_lengths[offset] <= max_composer_tokens:
+                kept_indices.append(start + offset)
     return Subset(dataset, kept_indices)
 
 
@@ -230,13 +347,69 @@ def load_default_4_4_2_blended_dataset(
     with_replacement: bool = False,
 ) -> BlendResult:
     """Loads and blends Open-Platypus, LongMagpie, and no_robots by 4:4:2."""
+    return load_blended_dataset(
+        split=split,
+        seed=seed,
+        epoch_size=epoch_size,
+        with_replacement=with_replacement,
+        ratios=[4, 4, 2],
+    )
+
+
+def load_stage1_kd_blended_dataset(
+    *,
+    split: str = "train",
+    seed: int = 42,
+    epoch_size: int = 30_000,
+    with_replacement: bool = False,
+) -> BlendResult:
+    """Loads the 30k Stage 1 KD blend with LongMagpie-heavy sampling."""
+    return load_blended_dataset(
+        split=split,
+        seed=seed,
+        epoch_size=epoch_size,
+        with_replacement=with_replacement,
+        ratios=[2, 7, 1],
+    )
+
+
+def load_stage23_blended_dataset(
+    *,
+    split: str = "train",
+    seed: int = 42,
+    epoch_size: int = 200_000,
+    with_replacement: bool = True,
+) -> BlendResult:
+    """Loads the 200k Stage 2/3 blend with 40/40/20 sampling."""
+    return load_blended_dataset(
+        split=split,
+        seed=seed,
+        epoch_size=epoch_size,
+        with_replacement=with_replacement,
+        ratios=[4, 4, 2],
+    )
+
+
+def load_blended_dataset(
+    *,
+    split: str = "train",
+    seed: int = 42,
+    epoch_size: Optional[int] = None,
+    with_replacement: bool = False,
+    ratios: Sequence[int] = (4, 4, 2),
+) -> BlendResult:
+    """Loads and blends Open-Platypus, LongMagpie, and no_robots with custom ratios."""
+    if load_dataset is None:
+        raise ModuleNotFoundError("The 'datasets' package is required to load blended datasets.")
+
     open_platypus_hf = load_dataset("garage-bAInd/Open-Platypus", split=split)
     long_magpie_hf = _load_long_magpie_dataset(split=split)
     no_robots_hf = load_dataset("HuggingFaceH4/no_robots", split=split)
 
     long_magpie_hf = build_long_magpie_subset_with_length_limit(
         long_magpie_hf,
-        max_word_estimate=6000,
+        max_profiler_tokens=6080,
+        max_composer_tokens=6080,
     )
 
     open_platypus_ds = HFDatasetAdapter(open_platypus_hf, format_open_platypus, "open_platypus")
@@ -245,7 +418,7 @@ def load_default_4_4_2_blended_dataset(
 
     return build_ratio_concat_dataset(
         datasets=[open_platypus_ds, long_magpie_ds, no_robots_ds],
-        ratios=[4, 4, 2],
+        ratios=ratios,
         seed=seed,
         epoch_size=epoch_size,
         with_replacement=with_replacement,
@@ -259,6 +432,11 @@ def _load_long_magpie_dataset(split: str = "train") -> HFDataset:
     Dataset source:
         caskcsg/LongMagpie_multidoc_longcontext_dataset
     """
+    if load_dataset is None:
+        raise ModuleNotFoundError("The 'datasets' package is required to load LongMagpie.")
+    if snapshot_download is None:
+        raise ModuleNotFoundError("The 'huggingface_hub' package is required to load LongMagpie.")
+
     repo_id = "caskcsg/LongMagpie_singledoc_longcontext_dataset"
     snapshot_dir = snapshot_download(repo_id=repo_id, repo_type="dataset")
     return load_dataset(snapshot_dir, split=split)

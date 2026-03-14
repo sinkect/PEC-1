@@ -8,6 +8,8 @@ from .bridge import Extruder
 def _find_multiple(a, b):
     return (-(a // -b)) * b
 
+
+
 class SwiGLU(nn.Module):
     def __init__(self, hidden_dim: int, expansion: float = 4.0):
         super().__init__()
@@ -22,7 +24,7 @@ class SwiGLU(nn.Module):
 class PECEngine(nn.Module):
     def __init__(
             self,
-            profiler_path="profiler",
+            profiler_path="answerdotai/ModernBERT-base",
             composer_path="Qwen/Qwen3-1.7B",
             num_query_tokens=64,
             freeze_profiler=False,
@@ -30,11 +32,9 @@ class PECEngine(nn.Module):
 
     ):
         super().__init__()
-        current_dir = Path(__file__).parent
-        # 1. Load Models
-        self.profiler = AutoModel.from_pretrained(str(current_dir / profiler_path), local_files_only=True,
-                                                  dtype=torch.bfloat16,
-                                                  attn_implementation="flash_attention_2") if torch.cuda.is_available() else AutoModel.from_pretrained(str(current_dir / profiler_path), local_files_only=True)
+
+
+        self.profiler = AutoModel.from_pretrained(profiler_path, dtype=torch.bfloat16,attn_implementation="flash_attention_2") if torch.cuda.is_available() else AutoModel.from_pretrained(profiler_path)
         self.composer = AutoModelForCausalLM.from_pretrained(composer_path, dtype=torch.bfloat16,
                                                              attn_implementation="flash_attention_2") if torch.cuda.is_available() else AutoModelForCausalLM.from_pretrained(composer_path)
 
@@ -86,6 +86,33 @@ class PECEngine(nn.Module):
 
         nn.init.ones_(self.post_extruder_norm.weight)
 
+    def encode_soft_prompts(
+            self,
+            profiler_input_ids: torch.Tensor,
+            profiler_attention_mask: torch.Tensor,
+            return_gate_scores: bool = False,
+    ):
+        prof_outputs = self.profiler(
+            input_ids=profiler_input_ids,
+            attention_mask=profiler_attention_mask,
+        )
+        prof_hidden = prof_outputs.last_hidden_state
+
+        extruder_outputs = self.extruder(
+            context=prof_hidden,
+            attn_mask=profiler_attention_mask,
+            return_gate_scores=return_gate_scores,
+        )
+        if return_gate_scores:
+            extruded, gate_scores = extruder_outputs
+        else:
+            extruded = extruder_outputs
+            gate_scores = None
+
+        extruded = self.post_extruder_norm(extruded)
+        soft_prompts = self.projector(extruded)
+        return soft_prompts, gate_scores
+
     def forward(
             self,
             profiler_input_ids,
@@ -106,25 +133,11 @@ class PECEngine(nn.Module):
         device = self.composer.device
 
         # --- [Phase 1] Profiler & Extruder (Compression) ---
-        # 1. Encode with Profiler (Modern-BERT)
-        prof_outputs = self.profiler(
-            input_ids=profiler_input_ids,
-            attention_mask=profiler_attention_mask,
-        )
-        prof_hidden = prof_outputs.last_hidden_state  # [B, Seq_Enc, D_prof]
-
-        # 2. Extrude (Cross-Attention Compression)
-        # Result: [B, Num_Query, D_prof]
-        extruded, gate_scores = self.extruder(
-            context=prof_hidden,
-            attn_mask=profiler_attention_mask,
+        soft_prompts, gate_scores = self.encode_soft_prompts(
+            profiler_input_ids=profiler_input_ids,
+            profiler_attention_mask=profiler_attention_mask,
             return_gate_scores=True,
         )
-        extruded = self.post_extruder_norm(extruded)
-
-        # 3. Project to Composer Dimension
-        # Result: [B, Num_Query, D_comp] aka "Soft Prompts"
-        soft_prompts = self.projector(extruded)
 
 
         # --- [Phase 2] Composer Input Injection ---

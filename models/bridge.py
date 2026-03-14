@@ -99,9 +99,21 @@ class Extruder(nn.Module):
         self.hidden_size = hidden_size
         self.num_query_tokens = num_query_tokens
 
-        # Initialize Learnable Query
+        # Keep the original parameter name for checkpoint compatibility.
         self.query_tokens = nn.Parameter(torch.randn(1, num_query_tokens, hidden_size))
         nn.init.normal_(self.query_tokens, std=0.02)
+
+        conditioning_dim = hidden_size * 2
+        self.delta_mlp = nn.Sequential(
+            nn.Linear(conditioning_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, num_query_tokens * hidden_size),
+        )
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(conditioning_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, num_query_tokens),
+        )
 
         self.layers = nn.ModuleList([
             AttentionBlock(hidden_size, num_heads, num_key_value_heads)
@@ -109,6 +121,46 @@ class Extruder(nn.Module):
         ])
 
         self.final_norm = nn.RMSNorm(hidden_size, eps=1e-6)
+        self._init_dynamic_query()
+
+    def _init_dynamic_query(self) -> None:
+        for module in (self.delta_mlp, self.gate_mlp):
+            for layer in module:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+
+        delta_out = self.delta_mlp[-1]
+        gate_out = self.gate_mlp[-1]
+        nn.init.zeros_(delta_out.weight)
+        nn.init.zeros_(delta_out.bias)
+        nn.init.zeros_(gate_out.weight)
+        nn.init.zeros_(gate_out.bias)
+
+    def _build_conditioning_vector(
+        self,
+        context: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        cls_pool = context[:, 0, :]
+        if attn_mask is None:
+            mean_pool = context.mean(dim=1)
+        else:
+            mask = attn_mask.unsqueeze(-1).to(dtype=context.dtype)
+            mean_pool = (context * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        return torch.cat([cls_pool, mean_pool], dim=-1)
+
+    def build_query_tokens(
+        self,
+        context: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size = context.shape[0]
+        conditioning = self._build_conditioning_vector(context, attn_mask=attn_mask)
+        delta = self.delta_mlp(conditioning).view(batch_size, self.num_query_tokens, self.hidden_size)
+        gate = torch.sigmoid(self.gate_mlp(conditioning)).view(batch_size, self.num_query_tokens, 1)
+        return self.query_tokens.expand(batch_size, -1, -1) + (gate * delta)
 
     def forward(
         self,
@@ -120,10 +172,7 @@ class Extruder(nn.Module):
         Input: context [Batch, Doc_Len, Dim]
         Output: latents [Batch, Num_Queries, Dim]
         """
-        batch_size = context.shape[0]
-
-        # Expand latents for batch
-        latents = self.query_tokens.expand(batch_size, -1, -1)
+        latents = self.build_query_tokens(context, attn_mask=attn_mask)
 
 
         if attn_mask is not None:

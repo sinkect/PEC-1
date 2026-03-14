@@ -9,11 +9,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 import torch
-from rouge_score import rouge_scorer
 from torch.utils.data import Dataset
-from transformers import PreTrainedTokenizerBase
 
-from .dataset_mixing import load_default_4_4_2_blended_dataset
+try:
+    from rouge_score import rouge_scorer
+except ModuleNotFoundError:  # Optional for lightweight unit tests.
+    rouge_scorer = None
+
+try:
+    from transformers import PreTrainedTokenizerBase
+except ModuleNotFoundError:  # Optional for lightweight unit tests.
+    PreTrainedTokenizerBase = Any
 
 DEFAULT_BASE_MODELS: Sequence[str] = (
     "Qwen/Qwen3-1.7B",
@@ -151,7 +157,7 @@ def token_f1_score(reference: str, prediction: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-_ROUGE_SCORER = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+_ROUGE_SCORER = None if rouge_scorer is None else rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
 
 
 def rouge_l_f1_score(reference: str, prediction: str) -> float:
@@ -159,6 +165,8 @@ def rouge_l_f1_score(reference: str, prediction: str) -> float:
         return 1.0
     if not reference.strip() or not prediction.strip():
         return 0.0
+    if _ROUGE_SCORER is None:
+        return exact_match_score(reference, prediction)
     return float(_ROUGE_SCORER.score(reference, prediction)["rougeL"].fmeasure)
 
 
@@ -204,6 +212,8 @@ def build_heldout_eval_samples(
         split_indices = split_dataset_indices(len(all_samples), test_size=eval_ratio, seed=seed)
         eval_samples = [all_samples[index] for index in split_indices["eval"]]
     else:
+        from .dataset_mixing import load_default_4_4_2_blended_dataset
+
         blend_result = load_default_4_4_2_blended_dataset(
             split=split,
             seed=seed,
@@ -221,4 +231,3 @@ def build_heldout_eval_samples(
         write_jsonl(eval_samples, persist_path)
 
     return eval_samples
-
