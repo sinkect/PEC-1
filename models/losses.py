@@ -67,6 +67,22 @@ def _gather_answer_logits(
     return answer_logits
 
 
+def _align_labels_to_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    seq_diff = int(logits.shape[1] - labels.shape[1])
+    if seq_diff == 0:
+        return labels
+    if seq_diff > 0:
+        prefix = labels.new_full((labels.shape[0], seq_diff), -100)
+        return torch.cat([prefix, labels], dim=1)
+    raise ValueError(
+        "Labels are longer than logits during answer-only KL computation: "
+        f"logits_seq={logits.shape[1]}, labels_seq={labels.shape[1]}"
+    )
+
+
 def compute_answer_only_kl(
     *,
     student_logits: torch.Tensor,
@@ -78,6 +94,8 @@ def compute_answer_only_kl(
     """Computes KL only on answer-token positions for each sample."""
 
     temperature = max(float(temperature), 1e-5)
+    student_labels = _align_labels_to_logits(student_logits, student_labels)
+    teacher_labels = _align_labels_to_logits(teacher_logits, teacher_labels)
     student_answer_logits = _gather_answer_logits(student_logits, student_labels)
     teacher_answer_logits = _gather_answer_logits(teacher_logits, teacher_labels)
 
