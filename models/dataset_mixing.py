@@ -117,6 +117,10 @@ def _get_long_context_filter_tokenizers(
 
     profiler_tokenizer = AutoTokenizer.from_pretrained(profiler_tokenizer_name)
     composer_tokenizer = AutoTokenizer.from_pretrained(composer_tokenizer_name)
+    # These tokenizers are used only for exact length measurement during dataset filtering.
+    # Disable built-in max-length warnings so overlong samples can be counted and rejected cleanly.
+    profiler_tokenizer.model_max_length = int(1e9)
+    composer_tokenizer.model_max_length = int(1e9)
     if composer_tokenizer.pad_token_id is None:
         composer_tokenizer.pad_token = composer_tokenizer.eos_token
     return profiler_tokenizer, composer_tokenizer
@@ -345,6 +349,8 @@ def load_default_4_4_2_blended_dataset(
     seed: int = 42,
     epoch_size: Optional[int] = None,
     with_replacement: bool = False,
+    max_profiler_tokens: int = 6080,
+    max_composer_tokens: int = 6080,
 ) -> BlendResult:
     """Loads and blends Open-Platypus, LongMagpie, and no_robots by 4:4:2."""
     return load_blended_dataset(
@@ -353,6 +359,8 @@ def load_default_4_4_2_blended_dataset(
         epoch_size=epoch_size,
         with_replacement=with_replacement,
         ratios=[4, 4, 2],
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
     )
 
 
@@ -362,6 +370,8 @@ def load_stage1_kd_blended_dataset(
     seed: int = 42,
     epoch_size: int = 30_000,
     with_replacement: bool = False,
+    max_profiler_tokens: int = 6080,
+    max_composer_tokens: int = 6080,
 ) -> BlendResult:
     """Loads the 30k Stage 1 KD blend with LongMagpie-heavy sampling."""
     return load_blended_dataset(
@@ -370,6 +380,8 @@ def load_stage1_kd_blended_dataset(
         epoch_size=epoch_size,
         with_replacement=with_replacement,
         ratios=[2, 7, 1],
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
     )
 
 
@@ -379,6 +391,8 @@ def load_stage23_blended_dataset(
     seed: int = 42,
     epoch_size: int = 200_000,
     with_replacement: bool = True,
+    max_profiler_tokens: int = 6080,
+    max_composer_tokens: int = 6080,
 ) -> BlendResult:
     """Loads the 200k Stage 2/3 blend with 40/40/20 sampling."""
     return load_blended_dataset(
@@ -387,6 +401,8 @@ def load_stage23_blended_dataset(
         epoch_size=epoch_size,
         with_replacement=with_replacement,
         ratios=[4, 4, 2],
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
     )
 
 
@@ -397,6 +413,8 @@ def load_blended_dataset(
     epoch_size: Optional[int] = None,
     with_replacement: bool = False,
     ratios: Sequence[int] = (4, 4, 2),
+    max_profiler_tokens: int = 6080,
+    max_composer_tokens: int = 6080,
 ) -> BlendResult:
     """Loads and blends Open-Platypus, LongMagpie, and no_robots with custom ratios."""
     if load_dataset is None:
@@ -408,8 +426,8 @@ def load_blended_dataset(
 
     long_magpie_hf = build_long_magpie_subset_with_length_limit(
         long_magpie_hf,
-        max_profiler_tokens=6080,
-        max_composer_tokens=6080,
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
     )
 
     open_platypus_ds = HFDatasetAdapter(open_platypus_hf, format_open_platypus, "open_platypus")

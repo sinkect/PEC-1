@@ -255,13 +255,21 @@ class MaskingCurriculumCallback(TrainerCallback):
         return control
 
 
-def load_blend_for_stage(stage: StageSpec, seed: int) -> BlendResult:
+def load_blend_for_stage(
+    stage: StageSpec,
+    seed: int,
+    *,
+    max_profiler_tokens: int,
+    max_composer_tokens: int,
+) -> BlendResult:
     if stage.name == "stage1":
         return load_stage1_kd_blended_dataset(
             split="train",
             seed=seed,
             epoch_size=stage.train_samples,
             with_replacement=stage.with_replacement,
+            max_profiler_tokens=max_profiler_tokens,
+            max_composer_tokens=max_composer_tokens,
         )
 
     return load_stage23_blended_dataset(
@@ -269,6 +277,8 @@ def load_blend_for_stage(stage: StageSpec, seed: int) -> BlendResult:
         seed=seed,
         epoch_size=stage.train_samples,
         with_replacement=stage.with_replacement,
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
     )
 
 
@@ -452,7 +462,12 @@ def main() -> None:
                 f"(kl_lambda={args.stage1_kd_lambda}, temperature={args.stage1_kd_temperature})"
             )
 
-        blend_result = load_blend_for_stage(stage, seed=args.seed)
+        blend_result = load_blend_for_stage(
+            stage,
+            seed=args.seed,
+            max_profiler_tokens=args.max_profiler_len,
+            max_composer_tokens=args.max_composer_len,
+        )
         print(
             "Blend counts: "
             f"{dict(zip(blend_result.source_names, blend_result.per_dataset_counts))} "
