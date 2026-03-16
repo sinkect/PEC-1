@@ -81,7 +81,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--process-name", type=str, default="pec_training")
     parser.add_argument("--num-query-tokens", type=int, default=64)
     parser.add_argument("--num-train-epochs", type=float, default=2.0)
-    parser.add_argument("--gradient-checkpoint", type=bool, default=True)
+    parser.add_argument(
+        "--gradient-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--per-device-train-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=5e-4)
