@@ -57,13 +57,13 @@ def _gather_answer_logits(
     logits: torch.Tensor,
     labels: torch.Tensor,
 ) -> List[torch.Tensor]:
-    shift_logits = logits[:, :-1, :].float()
+    shift_logits = logits[:, :-1, :]
     shift_labels = labels[:, 1:]
     valid_mask = shift_labels != -100
 
     answer_logits: List[torch.Tensor] = []
     for sample_logits, sample_mask in zip(shift_logits, valid_mask):
-        answer_logits.append(sample_logits[sample_mask])
+        answer_logits.append(sample_logits[sample_mask].float())
     return answer_logits
 
 
@@ -144,7 +144,8 @@ def trainer_compute_loss_with_gate_l1(
         kd_config = KnowledgeDistillationConfig()
 
     student_inputs, teacher_inputs = _split_student_teacher_inputs(inputs)
-    outputs = model(**student_inputs)
+    needs_student_logits = teacher_model is not None and teacher_inputs and kd_config.lambda_value > 0.0
+    outputs = model(**student_inputs, return_logits=needs_student_logits)
 
     standard_loss = outputs["loss"]
     if standard_loss is None:

@@ -388,11 +388,36 @@ def _extract_last_number(text: str) -> str | None:
     return matches[-1] if matches else None
 
 
+def _extract_boxed_candidates(text: str) -> List[str]:
+    return [candidate.strip() for candidate in re.findall(r"boxed\{(.*?)\}", str(text), flags=re.DOTALL) if candidate.strip()]
+
+
+def _extract_preferred_number(text: str) -> str | None:
+    equality_matches = re.findall(r"=\s*([\-+]?\d*[\.,/]?\d+)", text)
+    if equality_matches:
+        return equality_matches[-1].replace(",", "")
+
+    cue_matches = re.findall(
+        r"(?:final answer|answer is|therefore|thus|hence|so|result(?: is)?|we get)\D*([\-+]?\d*[\.,/]?\d+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if cue_matches:
+        return cue_matches[-1].replace(",", "")
+
+    matches = re.findall(r"[\-+]?\d*[\.,/]?\d+", text)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0].replace(",", "")
+    return matches[-1].replace(",", "")
+
+
 def parse_answer_number(text: str, example: Mapping[str, Any] | None = None) -> str | None:
     candidate_answer = None
-    boxed_matches = re.findall(r"boxed\{(.*?)\}", text)
+    boxed_matches = _extract_boxed_candidates(text)
     if boxed_matches:
-        candidate_answer = boxed_matches[-1].strip()
+        candidate_answer = boxed_matches[-1]
 
     if candidate_answer is None:
         parts = text.split("answer is ")
@@ -404,9 +429,9 @@ def parse_answer_number(text: str, example: Mapping[str, Any] | None = None) -> 
         candidate_answer = last_paragraph.split(". ")[-1]
 
     if candidate_answer is not None:
-        match = re.search(r"[\-+]?\d*[\.,/]?\d+", candidate_answer)
-        if match:
-            return match.group().replace(",", "")
+        preferred = _extract_preferred_number(candidate_answer)
+        if preferred is not None:
+            return preferred
 
     fallback = _extract_last_number(text)
     if fallback is None:
@@ -415,6 +440,14 @@ def parse_answer_number(text: str, example: Mapping[str, Any] | None = None) -> 
         return str(float(fallback))
     except Exception:
         return None
+
+
+def parse_answer_number_strict(text: str, example: Mapping[str, Any] | None = None) -> str | None:
+    for candidate in reversed(_extract_boxed_candidates(text)):
+        preferred = _extract_preferred_number(candidate)
+        if preferred is not None:
+            return preferred
+    return None
 
 
 def parse_answer_yes_or_no(text: str, example: Mapping[str, Any] | None = None) -> str | None:
@@ -430,9 +463,24 @@ def parse_answer_yes_or_no(text: str, example: Mapping[str, Any] | None = None) 
     return matches[-1] if matches else None
 
 
+def parse_answer_yes_or_no_strict(text: str, example: Mapping[str, Any] | None = None) -> str | None:
+    for match_str in reversed(_extract_boxed_candidates(text)):
+        lowered = match_str.lower()
+        if "yes" in lowered:
+            return "yes"
+        if "no" in lowered:
+            return "no"
+    return None
+
+
 def parse_answer_date(text: str, example: Mapping[str, Any] | None = None) -> str | None:
-    def normalize_date(answer: str) -> str:
-        month, day, year = answer.split("/")
+    def normalize_date(answer: str) -> str | None:
+        parts = [part.strip() for part in str(answer).split("/") if part.strip()]
+        if len(parts) != 3:
+            return None
+        month, day, year = parts
+        if not (month.isdigit() and day.isdigit() and year.isdigit()):
+            return None
         if len(month) == 1:
             month = "0" + month
         if len(day) == 1:
@@ -441,14 +489,32 @@ def parse_answer_date(text: str, example: Mapping[str, Any] | None = None) -> st
             year = "20" + year
         return "/".join((month, day, year))
 
-    boxed_matches = re.findall(r"\{([0-9/]*)\}", text)
-    for match_str in reversed(boxed_matches):
-        if match_str:
-            return normalize_date(match_str)
+    for match_str in reversed(_extract_boxed_candidates(text)):
+        normalized = normalize_date(match_str)
+        if normalized is not None:
+            return normalized
 
     matches = re.findall(r"(0?[1-9]|1[0-2])/(0?[1-9]|[12][0-9]|3[01])/([0-9]{4})", text)
     if matches:
         return normalize_date("/".join(matches[-1]))
+    return None
+
+
+def parse_answer_date_strict(text: str, example: Mapping[str, Any] | None = None) -> str | None:
+    for match_str in reversed(_extract_boxed_candidates(text)):
+        parts = [part.strip() for part in str(match_str).split("/") if part.strip()]
+        if len(parts) != 3:
+            continue
+        month, day, year = parts
+        if not (month.isdigit() and day.isdigit() and year.isdigit()):
+            continue
+        if len(month) == 1:
+            month = "0" + month
+        if len(day) == 1:
+            day = "0" + day
+        if len(year) == 2:
+            year = "20" + year
+        return "/".join((month, day, year))
     return None
 
 
@@ -471,9 +537,9 @@ def _best_matching_index(options: Sequence[str], prediction_text: str) -> int:
 
 
 def parse_multiple_choice_answer(text: str, example: Mapping[str, Any]) -> str:
-    boxed_matches = re.findall(r"boxed\{(.*?)\}", text)
+    boxed_matches = _extract_boxed_candidates(text)
     if boxed_matches:
-        text = boxed_matches[-1].strip()
+        text = boxed_matches[-1]
     else:
         text = text.split("\n")[-1]
     prediction = text.strip()
@@ -491,10 +557,29 @@ def parse_multiple_choice_answer(text: str, example: Mapping[str, Any]) -> str:
     return labels[_best_matching_index(options, text)]
 
 
+def parse_multiple_choice_answer_strict(text: str, example: Mapping[str, Any]) -> str | None:
+    boxed_matches = _extract_boxed_candidates(text)
+    if not boxed_matches:
+        return None
+    prediction = boxed_matches[-1].strip()
+
+    explicit_choice = re.findall(r"\(([A-E])\)", prediction)
+    if explicit_choice:
+        return explicit_choice[-1]
+
+    bare_choice = re.findall(r"(?<![a-zA-Z])[ABCDE](?![a-zA-Z])", prediction)
+    if bare_choice:
+        return bare_choice[-1]
+
+    options = [choice["text"] for choice in example["question"]["choices"]]
+    labels = [choice["label"] for choice in example["question"]["choices"]]
+    return labels[_best_matching_index(options, prediction)]
+
+
 def parse_multiple_choice_aqua(text: str, example: Mapping[str, Any]) -> str:
-    boxed_matches = re.findall(r"boxed\{(.*?)\}", text)
+    boxed_matches = _extract_boxed_candidates(text)
     if boxed_matches:
-        text = boxed_matches[-1].strip()
+        text = boxed_matches[-1]
     else:
         text = text.split("\n")[-1]
     prediction = text.strip()
@@ -509,6 +594,24 @@ def parse_multiple_choice_aqua(text: str, example: Mapping[str, Any]) -> str:
 
     labels = ["A", "B", "C", "D", "E"]
     return labels[_best_matching_index(example["options"], text)]
+
+
+def parse_multiple_choice_aqua_strict(text: str, example: Mapping[str, Any]) -> str | None:
+    boxed_matches = _extract_boxed_candidates(text)
+    if not boxed_matches:
+        return None
+    prediction = boxed_matches[-1].strip()
+
+    explicit_choice = re.findall(r"\(([A-E])\)", prediction)
+    if explicit_choice:
+        return explicit_choice[-1]
+
+    bare_choice = re.findall(r"(?<![a-zA-Z])[ABCDE](?![a-zA-Z])", prediction)
+    if bare_choice:
+        return bare_choice[-1]
+
+    labels = ["A", "B", "C", "D", "E"]
+    return labels[_best_matching_index(example["options"], prediction)]
 
 
 def _strip_math_string(value: str) -> str:
@@ -561,6 +664,11 @@ def parse_math_answer(text: str, example: Mapping[str, Any] | None = None) -> st
 def parse_text_answer(text: str, example: Mapping[str, Any] | None = None) -> str | None:
     boxed_matches = re.findall(r"boxed\{(.*?)\}", text)
     return boxed_matches[-1].strip() if boxed_matches else None
+
+
+def parse_text_answer_strict(text: str, example: Mapping[str, Any] | None = None) -> str | None:
+    boxed_matches = _extract_boxed_candidates(text)
+    return boxed_matches[-1] if boxed_matches else None
 
 
 def normalize_numeric_answer(text: str, unit: str | None = None) -> str:
@@ -648,14 +756,34 @@ def parse_re2_answer(
     example: Mapping[str, Any],
     *,
     act: str = "vanilla",
+    mode: str = "relaxed",
 ) -> Any:
+    if mode not in {"strict", "relaxed"}:
+        raise ValueError(f"Unsupported parse mode: {mode}")
+
     if act == "pal":
         executed_result = execute_pal_solution(text, dataset_name)
         if executed_result is None:
             return None
         text = executed_result
+        mode = "relaxed"
 
     config = get_dataset_config(dataset_name)
+    if mode == "strict":
+        if config.answer_kind == "number":
+            return parse_answer_number_strict(text, example)
+        if config.answer_kind == "yes_no":
+            return parse_answer_yes_or_no_strict(text, example)
+        if config.answer_kind == "date":
+            return parse_answer_date_strict(text, example)
+        if config.name == "aqua":
+            return parse_multiple_choice_aqua_strict(text, example)
+        if config.answer_kind == "choice":
+            return parse_multiple_choice_answer_strict(text, example)
+        if config.name == "MATH":
+            return parse_math_answer(text, example)
+        return parse_text_answer_strict(text, example)
+
     if config.answer_kind == "number":
         return parse_answer_number(text, example)
     if config.answer_kind == "yes_no":
@@ -696,6 +824,14 @@ def summarize_re2_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any
     if num_samples == 0:
         return {
             "num_samples": 0,
+            "strict_correct_num": 0,
+            "strict_accuracy": 0.0,
+            "strict_null_num": 0,
+            "strict_null_rate": 0.0,
+            "relaxed_correct_num": 0,
+            "relaxed_accuracy": 0.0,
+            "relaxed_null_num": 0,
+            "relaxed_null_rate": 0.0,
             "correct_num": 0,
             "accuracy": 0.0,
             "null_num": 0,
@@ -704,15 +840,29 @@ def summarize_re2_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any
             "no_boxed_rate": 0.0,
         }
 
-    correct_num = sum(int(record.get("score", 0)) for record in records)
-    null_num = sum(1 for record in records if record.get("parsed_prediction") is None)
+    strict_correct_num = sum(int(record.get("strict_score", 0)) for record in records)
+    strict_null_num = sum(1 for record in records if record.get("strict_parsed_prediction") is None)
+    relaxed_correct_num = sum(int(record.get("relaxed_score", record.get("score", 0))) for record in records)
+    relaxed_null_num = sum(
+        1
+        for record in records
+        if record.get("relaxed_parsed_prediction", record.get("parsed_prediction")) is None
+    )
     no_boxed_num = sum(int(record.get("no_boxed", 0)) for record in records)
     return {
         "num_samples": num_samples,
-        "correct_num": correct_num,
-        "accuracy": correct_num / num_samples,
-        "null_num": null_num,
-        "null_rate": null_num / num_samples,
+        "strict_correct_num": strict_correct_num,
+        "strict_accuracy": strict_correct_num / num_samples,
+        "strict_null_num": strict_null_num,
+        "strict_null_rate": strict_null_num / num_samples,
+        "relaxed_correct_num": relaxed_correct_num,
+        "relaxed_accuracy": relaxed_correct_num / num_samples,
+        "relaxed_null_num": relaxed_null_num,
+        "relaxed_null_rate": relaxed_null_num / num_samples,
+        "correct_num": relaxed_correct_num,
+        "accuracy": relaxed_correct_num / num_samples,
+        "null_num": relaxed_null_num,
+        "null_rate": relaxed_null_num / num_samples,
         "no_boxed_num": no_boxed_num,
         "no_boxed_rate": no_boxed_num / num_samples,
     }
@@ -741,12 +891,20 @@ def build_arc_total_summary(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str,
                 "act": row.get("act"),
                 "read_times": row.get("read_times"),
                 "num_samples": 0,
+                "strict_correct_num": 0,
+                "strict_null_num": 0,
+                "relaxed_correct_num": 0,
+                "relaxed_null_num": 0,
                 "correct_num": 0,
                 "null_num": 0,
                 "no_boxed_num": 0,
             },
         )
         bucket["num_samples"] += int(row.get("num_samples", 0))
+        bucket["strict_correct_num"] += int(row.get("strict_correct_num", 0))
+        bucket["strict_null_num"] += int(row.get("strict_null_num", 0))
+        bucket["relaxed_correct_num"] += int(row.get("relaxed_correct_num", row.get("correct_num", 0)))
+        bucket["relaxed_null_num"] += int(row.get("relaxed_null_num", row.get("null_num", 0)))
         bucket["correct_num"] += int(row.get("correct_num", 0))
         bucket["null_num"] += int(row.get("null_num", 0))
         bucket["no_boxed_num"] += int(row.get("no_boxed_num", 0))
@@ -756,6 +914,10 @@ def build_arc_total_summary(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str,
         num_samples = row["num_samples"]
         if num_samples == 0:
             continue
+        row["strict_accuracy"] = row["strict_correct_num"] / num_samples
+        row["strict_null_rate"] = row["strict_null_num"] / num_samples
+        row["relaxed_accuracy"] = row["relaxed_correct_num"] / num_samples
+        row["relaxed_null_rate"] = row["relaxed_null_num"] / num_samples
         row["accuracy"] = row["correct_num"] / num_samples
         row["null_rate"] = row["null_num"] / num_samples
         row["no_boxed_rate"] = row["no_boxed_num"] / num_samples

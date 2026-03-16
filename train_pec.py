@@ -1,12 +1,16 @@
 import argparse
 import gc
+import json
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 import torch
+from safetensors.torch import load_file as load_safetensors
 from torch.utils.data import Dataset, Subset
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -25,11 +29,7 @@ from models.dataset_mixing import (
     save_sampled_by_source_as_jsonl,
 )
 from models.losses import GateL1Trainer
-
-try:
-    import setproctitle
-except ModuleNotFoundError:
-    setproctitle = None
+import setproctitle
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PEC with stage-aware masking and Stage 1 KD.")
     parser.add_argument("--output-dir", type=Path, default=base_dir / "outputs" / "PEC")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
+    parser.add_argument("--init-from-checkpoint", type=Path, default=None)
     parser.add_argument("--profiler-model-path", type=str, default="answerdotai/ModernBERT-base")
     parser.add_argument("--composer-model-name", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument(
@@ -77,9 +78,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage23-mask-prob-end", type=float, default=None)
     parser.add_argument("--stage1-kd-lambda", type=float, default=0.3)
     parser.add_argument("--stage1-kd-temperature", type=float, default=2.0)
-
+    parser.add_argument("--process-name", type=str, default="pec_training")
     parser.add_argument("--num-query-tokens", type=int, default=64)
     parser.add_argument("--num-train-epochs", type=float, default=2.0)
+    parser.add_argument("--gradient-checkpoint", type=bool, default=True)
     parser.add_argument("--per-device-train-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=5e-4)
@@ -131,12 +133,6 @@ def clear_memory() -> None:
         torch.cuda.empty_cache()
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
-
-
-def set_training_process_title(stage_name: str) -> None:
-    if setproctitle is None:
-        return
-    setproctitle.setproctitle(f"sinkect_training_{stage_name}")
 
 
 class BlendedMessagesToPECSamples(Dataset):
@@ -216,10 +212,10 @@ class MaskingCurriculumCallback(TrainerCallback):
     """Linearly anneals train-time masking from heavy to light over steps."""
 
     def __init__(
-        self,
-        shared_mask_prob: SharedMaskProbability,
-        start_prob: float,
-        end_prob: float,
+            self,
+            shared_mask_prob: SharedMaskProbability,
+            start_prob: float,
+            end_prob: float,
     ) -> None:
         self.shared_mask_prob = shared_mask_prob
         self.start_prob = float(start_prob)
@@ -256,11 +252,11 @@ class MaskingCurriculumCallback(TrainerCallback):
 
 
 def load_blend_for_stage(
-    stage: StageSpec,
-    seed: int,
-    *,
-    max_profiler_tokens: int,
-    max_composer_tokens: int,
+        stage: StageSpec,
+        seed: int,
+        *,
+        max_profiler_tokens: int,
+        max_composer_tokens: int,
 ) -> BlendResult:
     if stage.name == "stage1":
         return load_stage1_kd_blended_dataset(
@@ -283,12 +279,12 @@ def load_blend_for_stage(
 
 
 def build_stage_datasets(
-    *,
-    stage: StageSpec,
-    base_dataset: Dataset,
-    composer_tokenizer,
-    eval_ratio: float,
-    seed: int,
+        *,
+        stage: StageSpec,
+        base_dataset: Dataset,
+        composer_tokenizer,
+        eval_ratio: float,
+        seed: int,
 ):
     split_indices = split_dataset_indices(len(base_dataset), test_size=eval_ratio, seed=seed)
     train_base = Subset(base_dataset, split_indices["train"])
@@ -337,6 +333,7 @@ def build_training_arguments(args: argparse.Namespace, output_dir: Path, device:
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_checkpointing=args.gradient_checkpoint,
         learning_rate=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_steps=args.warmup_steps,
@@ -390,10 +387,10 @@ def load_teacher_model(model_name: str, device: torch.device, dtype: torch.dtype
 
 
 def persist_stage_metadata(
-    *,
-    base_dir: Path,
-    stage: StageSpec,
-    blend_result: BlendResult,
+        *,
+        base_dir: Path,
+        stage: StageSpec,
+        blend_result: BlendResult,
 ) -> None:
     processed_data_dir = base_dir / "data" / "processed_pec_dataset" / stage.name
     save_blend_metadata(blend_result, processed_data_dir / "blend_metadata.json")
@@ -406,14 +403,106 @@ def persist_stage_metadata(
     )
 
 
+def load_state_dict_from_checkpoint(checkpoint_dir: Path) -> Dict[str, Any]:
+    safetensor_path = checkpoint_dir / "model.safetensors"
+    pytorch_path = checkpoint_dir / "pytorch_model.bin"
+
+    if safetensor_path.exists():
+        state_dict = load_safetensors(str(safetensor_path))
+    elif pytorch_path.exists():
+        state_dict = torch.load(pytorch_path, map_location="cpu")
+    else:
+        raise FileNotFoundError(f"No model checkpoint found in {checkpoint_dir}")
+
+    if all(key.startswith("module.") for key in state_dict):
+        return {key.removeprefix("module."): value for key, value in state_dict.items()}
+    return state_dict
+
+
+def initialize_model_from_checkpoint(model: PECEngine, checkpoint_dir: Path) -> None:
+    state_dict = load_state_dict_from_checkpoint(checkpoint_dir)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+    critical_missing = [
+        key for key in missing_keys
+        if not (key.startswith("composer.") or key.startswith("profiler."))
+    ]
+    if critical_missing:
+        raise RuntimeError(f"Critical weights are missing from checkpoint {checkpoint_dir}: {critical_missing}")
+    if unexpected_keys:
+        raise RuntimeError(f"Unexpected keys in checkpoint {checkpoint_dir}: {unexpected_keys}")
+
+    print(f"Initialized model weights from checkpoint: {checkpoint_dir}")
+
+
+def _checkpoint_sort_key(checkpoint_dir: Path) -> int:
+    try:
+        return int(checkpoint_dir.name.rsplit("-", 1)[-1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def _resolve_resumable_checkpoint_source(trainer: GateL1Trainer, stage_output_dir: Path) -> Optional[Path]:
+    best_checkpoint = getattr(trainer.state, "best_model_checkpoint", None)
+    if best_checkpoint is not None:
+        best_checkpoint_path = Path(best_checkpoint)
+        if best_checkpoint_path.exists():
+            return best_checkpoint_path
+
+    checkpoint_dirs = sorted(
+        (path for path in stage_output_dir.glob("checkpoint-*") if path.is_dir()),
+        key=_checkpoint_sort_key,
+    )
+    if checkpoint_dirs:
+        return checkpoint_dirs[-1]
+    return None
+
+
+def save_resumable_final_checkpoint(
+        trainer: GateL1Trainer,
+        *,
+        stage_output_dir: Path,
+        final_output_dir: Path,
+) -> None:
+    source_checkpoint = _resolve_resumable_checkpoint_source(trainer, stage_output_dir)
+
+    if trainer.is_world_process_zero():
+        if source_checkpoint is None:
+            raise RuntimeError(
+                "No checkpoint directory was found to export as a resumable final checkpoint. "
+                "Keep at least one saved checkpoint or lower --save-steps."
+            )
+
+        print(f"Exporting resumable final checkpoint from: {source_checkpoint}")
+        if final_output_dir.exists():
+            shutil.rmtree(final_output_dir)
+        shutil.copytree(source_checkpoint, final_output_dir)
+
+        trainer_state_path = final_output_dir / "trainer_state.json"
+        if trainer_state_path.exists():
+            trainer_state = json.loads(trainer_state_path.read_text())
+            if trainer_state.get("best_model_checkpoint"):
+                trainer_state["best_model_checkpoint"] = str(final_output_dir)
+            trainer_state_path.write_text(json.dumps(trainer_state, indent=2, sort_keys=True) + "\n")
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
 def main() -> None:
     args = parse_args()
+    if args.resume_from_checkpoint is not None and args.init_from_checkpoint is not None:
+        raise ValueError("--resume-from-checkpoint and --init-from-checkpoint cannot be used together.")
+    if args.init_from_checkpoint is not None and not args.init_from_checkpoint.is_dir():
+        raise ValueError(f"--init-from-checkpoint must point to a checkpoint directory: {args.init_from_checkpoint}")
+
     device = get_device()
     dtype = get_model_dtype(device)
     base_dir = Path(__file__).resolve().parent
     args.stages = normalize_stage_names(args.stages)
     stage_specs = get_stage_specs(args)
 
+    setproctitle.setproctitle(args.process_name + '-' + args.stages[0])
     print(f"Device: {device}")
     print(f"Output Directory: {args.output_dir}")
     print(f"Stages: {args.stages}")
@@ -430,6 +519,8 @@ def main() -> None:
         composer_path=args.composer_model_name,
         num_query_tokens=args.num_query_tokens,
     )
+    if args.init_from_checkpoint is not None:
+        initialize_model_from_checkpoint(model, args.init_from_checkpoint)
 
     teacher_model = None
     if "stage1" in args.stages:
@@ -447,7 +538,6 @@ def main() -> None:
     for stage_name in args.stages:
         stage = stage_specs[stage_name]
         stage_output_dir = args.output_dir / stage.name
-        set_training_process_title(stage.name)
         print(f"\n===== {stage.name.upper()} =====")
         if stage.mask_prob_start is None:
             print("Composer visible prompt: soft prompt only")
@@ -516,7 +606,11 @@ def main() -> None:
             print(f"Resuming {stage.name} from checkpoint: {resume_checkpoint}")
         trainer.train(resume_from_checkpoint=resume_checkpoint)
         resume_checkpoint = None
-        trainer.save_model(str(stage_output_dir / "final"))
+        save_resumable_final_checkpoint(
+            trainer,
+            stage_output_dir=stage_output_dir,
+            final_output_dir=stage_output_dir / "final",
+        )
 
         if stage.include_teacher and teacher_model is not None:
             teacher_model.to("cpu")

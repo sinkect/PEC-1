@@ -22,6 +22,8 @@ class SwiGLU(nn.Module):
         return self.down_proj(F.silu(gate) * up)
 
 class PECEngine(nn.Module):
+    supports_gradient_checkpointing = True
+
     def __init__(
             self,
             profiler_path="answerdotai/ModernBERT-base",
@@ -68,6 +70,8 @@ class PECEngine(nn.Module):
         if self.pad_token_id is None:
             self.pad_token_id = self.composer.config.eos_token_id
 
+        self._gradient_checkpointing_enabled = False
+        self._composer_use_cache_default = getattr(self.composer.config, "use_cache", None)
 
         self._init_weights()
 
@@ -85,6 +89,44 @@ class PECEngine(nn.Module):
         nn.init.normal_(self.sep_token, mean=0.0, std=0.04)
 
         nn.init.ones_(self.post_extruder_norm.weight)
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        if self._gradient_checkpointing_enabled:
+            return True
+        return any(
+            bool(getattr(module, "is_gradient_checkpointing", False))
+            for module in (self.profiler, self.composer)
+        )
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+        self._gradient_checkpointing_enabled = True
+
+        for module in (self.profiler, self.composer):
+            method = getattr(module, "gradient_checkpointing_enable", None)
+            if method is None:
+                continue
+            if gradient_checkpointing_kwargs is None:
+                method()
+                continue
+            try:
+                method(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+            except TypeError:
+                method()
+
+        if hasattr(self.composer.config, "use_cache"):
+            self.composer.config.use_cache = False
+
+    def gradient_checkpointing_disable(self) -> None:
+        self._gradient_checkpointing_enabled = False
+
+        for module in (self.profiler, self.composer):
+            method = getattr(module, "gradient_checkpointing_disable", None)
+            if method is not None:
+                method()
+
+        if self._composer_use_cache_default is not None and hasattr(self.composer.config, "use_cache"):
+            self.composer.config.use_cache = self._composer_use_cache_default
 
     def encode_soft_prompts(
             self,
@@ -119,7 +161,8 @@ class PECEngine(nn.Module):
             profiler_attention_mask,
             composer_input_ids,
             composer_attention_mask,
-            labels=None
+            labels=None,
+            return_logits: bool = False,
     ):
         """
         New Forward Logic for Dynamic Masking Pipeline.
@@ -171,11 +214,13 @@ class PECEngine(nn.Module):
         outputs = self.composer(
             inputs_embeds=final_inputs_embeds,
             attention_mask=final_attention_mask,
-            labels=final_labels
+            labels=final_labels,
+            use_cache=False,
+            return_dict=True,
         )
 
         return {
             "loss": outputs.loss,
-            "logits": outputs.logits,
+            "logits": outputs.logits if return_logits else None,
             "gate_scores": gate_scores,
         }

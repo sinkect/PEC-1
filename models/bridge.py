@@ -82,7 +82,7 @@ class AttentionBlock(nn.Module):
         context_norm = self.norm_k(context)  # [B, S_ctx, D]
 
         attn_out = self.attn(latents_norm, context_norm, attn_mask=attn_mask)  # [B, N_q, D]
-        gate_scores = F.silu(self.gate_proj(latents_norm))  # [B, N_q, D]
+        gate_scores = torch.sigmoid(self.gate_proj(latents_norm))  # [B, N_q, D]
         gated_out = attn_out * gate_scores  # [B, N_q, D]
         out = self.out_proj(gated_out)  # [B, N_q, D]
         updated_latents = latents + out  # [B, N_q, D]
