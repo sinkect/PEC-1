@@ -133,6 +133,16 @@ def print_response_block(
                 )
                 print(f"    L{layer_index} {query_tokens}", flush=True)
 
+    def print_tensor_slice(title: str, slice_values: list[list[float]]) -> None:
+        if not slice_values:
+            print(f"  {title}: <none>", flush=True)
+            return
+
+        print(f"  {title}:", flush=True)
+        for row_index, row_values in enumerate(slice_values):
+            row = ", ".join(f"{value:.4f}" for value in row_values)
+            print(f"    q{row_index:02d} [{row}]", flush=True)
+
     visible_prompt_display = "<empty>" if visible_prompt == "" else visible_prompt
 
     print(f"\n[{label}]", flush=True)
@@ -154,8 +164,19 @@ def print_response_block(
             f"abs_max={gate_stats['gate_logit_abs_max']:.6f}",
             flush=True,
         )
+        print(
+            f"  Latent Z: norm={gate_stats['latent_z_norm']:.6f}, "
+            f"mean={gate_stats['latent_z_mean']:.6f}, std={gate_stats['latent_z_std']:.6f}",
+            flush=True,
+        )
+        print(
+            f"  Soft prompt P: norm={gate_stats['soft_prompt_p_norm']:.6f}, "
+            f"mean={gate_stats['soft_prompt_p_mean']:.6f}, std={gate_stats['soft_prompt_p_std']:.6f}",
+            flush=True,
+        )
         print_layer_query_table("Gate score by layer/query", gate_stats["gate_layer_query_mean"])
         print_layer_query_table("Gate logits by layer/query", gate_stats["gate_logit_layer_query_mean"])
+        print_tensor_slice("P[0, :5, :8]", gate_stats["soft_prompt_p_slice"])
 
 
 def print_help() -> None:

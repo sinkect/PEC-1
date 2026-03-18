@@ -128,7 +128,7 @@ class PECEngine(nn.Module):
         if self._composer_use_cache_default is not None and hasattr(self.composer.config, "use_cache"):
             self.composer.config.use_cache = self._composer_use_cache_default
 
-    def encode_soft_prompts(
+    def build_soft_prompt_artifacts(
             self,
             profiler_input_ids: torch.Tensor,
             profiler_attention_mask: torch.Tensor,
@@ -149,18 +149,39 @@ class PECEngine(nn.Module):
         )
         if return_gate_scores:
             if return_gate_logits:
-                extruded, gate_scores, gate_logits = extruder_outputs
+                extruder_latents, gate_scores, gate_logits = extruder_outputs
             else:
-                extruded, gate_scores = extruder_outputs
+                extruder_latents, gate_scores = extruder_outputs
                 gate_logits = None
         else:
-            extruded = extruder_outputs
+            extruder_latents = extruder_outputs
             gate_scores = None
             gate_logits = None
 
-        extruded = self.post_extruder_norm(extruded)
-        soft_prompts = self.projector(extruded)
-        return soft_prompts, gate_scores, gate_logits
+        projected_input = self.post_extruder_norm(extruder_latents)
+        soft_prompts = self.projector(projected_input)
+        return {
+            "soft_prompts": soft_prompts,
+            "extruder_latents": extruder_latents,
+            "projected_input": projected_input,
+            "gate_scores": gate_scores,
+            "gate_logits": gate_logits,
+        }
+
+    def encode_soft_prompts(
+            self,
+            profiler_input_ids: torch.Tensor,
+            profiler_attention_mask: torch.Tensor,
+            return_gate_scores: bool = False,
+            return_gate_logits: bool = False,
+    ):
+        artifacts = self.build_soft_prompt_artifacts(
+            profiler_input_ids=profiler_input_ids,
+            profiler_attention_mask=profiler_attention_mask,
+            return_gate_scores=return_gate_scores,
+            return_gate_logits=return_gate_logits,
+        )
+        return artifacts["soft_prompts"], artifacts["gate_scores"], artifacts["gate_logits"]
 
     def forward(
             self,

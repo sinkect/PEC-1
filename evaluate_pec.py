@@ -395,6 +395,28 @@ def generate_pec_responses(
     min_p: float = 0.0,
     enable_thinking: bool,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
+    def summarize_tensor(tensor: torch.Tensor, *, prefix: str) -> Dict[str, Any]:
+        tensor_float = tensor.detach().float()
+        return {
+            f"{prefix}_norm": float(torch.linalg.vector_norm(tensor_float).item()),
+            f"{prefix}_mean": float(tensor_float.mean().item()),
+            f"{prefix}_std": float(tensor_float.std(unbiased=False).item()),
+        }
+
+    def summarize_soft_prompt_artifacts(
+        extruder_latents: torch.Tensor,
+        soft_prompts: torch.Tensor,
+    ) -> List[Dict[str, Any]]:
+        p_slice = soft_prompts[:, :5, :8].detach().float().cpu().tolist()
+        return [
+            {
+                **summarize_tensor(z_sample, prefix="latent_z"),
+                **summarize_tensor(p_sample, prefix="soft_prompt_p"),
+                "soft_prompt_p_slice": p_head,
+            }
+            for z_sample, p_sample, p_head in zip(extruder_latents, soft_prompts, p_slice)
+        ]
+
     def summarize_gated_attention(
         gate_scores: torch.Tensor,
         gate_logits: torch.Tensor | None,
@@ -483,12 +505,16 @@ def generate_pec_responses(
     )
     composer_inputs = move_tokenized_batch(composer_inputs, device)
 
-    soft_prompts, gate_scores, gate_logits = model.encode_soft_prompts(
+    artifacts = model.build_soft_prompt_artifacts(
         profiler_input_ids=profiler_inputs["input_ids"],
         profiler_attention_mask=profiler_inputs["attention_mask"],
         return_gate_scores=True,
         return_gate_logits=True,
     )
+    soft_prompts = artifacts["soft_prompts"]
+    extruder_latents = artifacts["extruder_latents"]
+    gate_scores = artifacts["gate_scores"]
+    gate_logits = artifacts["gate_logits"]
 
     text_embeds = model.composer.get_input_embeddings()(composer_inputs["input_ids"])
     final_inputs_embeds = torch.cat([soft_prompts, text_embeds], dim=1)
@@ -554,6 +580,14 @@ def generate_pec_responses(
         generated_texts = ["" for _ in clean_prompt_texts]
 
     gate_stats = summarize_gated_attention(gate_scores, gate_logits)
+    soft_prompt_stats = summarize_soft_prompt_artifacts(extruder_latents, soft_prompts)
+    gate_stats = [
+        {
+            **per_gate_stats,
+            **per_soft_prompt_stats,
+        }
+        for per_gate_stats, per_soft_prompt_stats in zip(gate_stats, soft_prompt_stats)
+    ]
     return generated_texts, gate_stats
 
 
