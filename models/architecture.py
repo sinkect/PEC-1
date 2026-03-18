@@ -133,6 +133,7 @@ class PECEngine(nn.Module):
             profiler_input_ids: torch.Tensor,
             profiler_attention_mask: torch.Tensor,
             return_gate_scores: bool = False,
+            return_gate_logits: bool = False,
     ):
         prof_outputs = self.profiler(
             input_ids=profiler_input_ids,
@@ -144,16 +145,22 @@ class PECEngine(nn.Module):
             context=prof_hidden,
             attn_mask=profiler_attention_mask,
             return_gate_scores=return_gate_scores,
+            return_gate_logits=return_gate_logits,
         )
         if return_gate_scores:
-            extruded, gate_scores = extruder_outputs
+            if return_gate_logits:
+                extruded, gate_scores, gate_logits = extruder_outputs
+            else:
+                extruded, gate_scores = extruder_outputs
+                gate_logits = None
         else:
             extruded = extruder_outputs
             gate_scores = None
+            gate_logits = None
 
         extruded = self.post_extruder_norm(extruded)
         soft_prompts = self.projector(extruded)
-        return soft_prompts, gate_scores
+        return soft_prompts, gate_scores, gate_logits
 
     def forward(
             self,
@@ -176,7 +183,7 @@ class PECEngine(nn.Module):
         device = self.composer.device
 
         # --- [Phase 1] Profiler & Extruder (Compression) ---
-        soft_prompts, gate_scores = self.encode_soft_prompts(
+        soft_prompts, gate_scores, _ = self.encode_soft_prompts(
             profiler_input_ids=profiler_input_ids,
             profiler_attention_mask=profiler_attention_mask,
             return_gate_scores=True,

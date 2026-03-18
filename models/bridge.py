@@ -75,19 +75,27 @@ class AttentionBlock(nn.Module):
         context: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         return_gate: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return_gate_logits: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         # Cross-Attention Block
 
         latents_norm = self.norm_q(latents)  # [B, N_q, D]
         context_norm = self.norm_k(context)  # [B, S_ctx, D]
 
         attn_out = self.attn(latents_norm, context_norm, attn_mask=attn_mask)  # [B, N_q, D]
-        gate_scores = torch.sigmoid(self.gate_proj(latents_norm))  # [B, N_q, D]
+        gate_logits = self.gate_proj(latents_norm)  # [B, N_q, D]
+        gate_scores = torch.sigmoid(gate_logits)  # [B, N_q, D]
         gated_out = attn_out * gate_scores  # [B, N_q, D]
         out = self.out_proj(gated_out)  # [B, N_q, D]
         updated_latents = latents + out  # [B, N_q, D]
 
         if return_gate:
+            if return_gate_logits:
+                return updated_latents, gate_scores, gate_logits
             return updated_latents, gate_scores
         return updated_latents
 
@@ -167,7 +175,12 @@ class Extruder(nn.Module):
         context: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         return_gate_scores: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return_gate_logits: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         """
         Input: context [Batch, Doc_Len, Dim]
         Output: latents [Batch, Num_Queries, Dim]
@@ -181,14 +194,21 @@ class Extruder(nn.Module):
 
         # Iterative refinement
         collected_gate_scores = []
+        collected_gate_logits = []
         for layer in self.layers:
             if return_gate_scores:
-                latents, gate_scores = layer(
+                layer_outputs = layer(
                     latents,
                     context,
                     attn_mask=attn_mask,
                     return_gate=True,
+                    return_gate_logits=return_gate_logits,
                 )
+                if return_gate_logits:
+                    latents, gate_scores, gate_logits = layer_outputs
+                    collected_gate_logits.append(gate_logits)  # each: [B, N_q, D]
+                else:
+                    latents, gate_scores = layer_outputs
                 collected_gate_scores.append(gate_scores)  # each: [B, N_q, D]
             else:
                 latents = layer(latents, context, attn_mask=attn_mask)
@@ -196,7 +216,20 @@ class Extruder(nn.Module):
         latents = self.final_norm(latents)  # [B, N_q, D]
 
         if return_gate_scores:
-            stacked_gate_scores = torch.stack(collected_gate_scores, dim=1)  # [B, L, N_q, D]
+            if collected_gate_scores:
+                stacked_gate_scores = torch.stack(collected_gate_scores, dim=1)  # [B, L, N_q, D]
+            else:
+                stacked_gate_scores = latents.new_empty(
+                    (latents.shape[0], 0, self.num_query_tokens, self.hidden_size)
+                )
+            if return_gate_logits:
+                if collected_gate_logits:
+                    stacked_gate_logits = torch.stack(collected_gate_logits, dim=1)  # [B, L, N_q, D]
+                else:
+                    stacked_gate_logits = latents.new_empty(
+                        (latents.shape[0], 0, self.num_query_tokens, self.hidden_size)
+                    )
+                return latents, stacked_gate_scores, stacked_gate_logits
             return latents, stacked_gate_scores
 
         return latents

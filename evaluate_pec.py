@@ -355,7 +355,7 @@ def generate_pec_response(
     top_k: int = 20,
     min_p: float = 0.0,
     enable_thinking: bool,
-) -> Tuple[str, Dict[str, float]]:
+) -> Tuple[str, Dict[str, Any]]:
     generated_texts, gate_stats = generate_pec_responses(
         model=model,
         profiler_tokenizer=profiler_tokenizer,
@@ -394,7 +394,69 @@ def generate_pec_responses(
     top_k: int = 20,
     min_p: float = 0.0,
     enable_thinking: bool,
-) -> Tuple[List[str], List[Dict[str, float]]]:
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    def summarize_gated_attention(
+        gate_scores: torch.Tensor,
+        gate_logits: torch.Tensor | None,
+    ) -> List[Dict[str, Any]]:
+        if gate_scores.ndim != 4:
+            raise ValueError(f"Expected gate_scores to have shape [B, L, N_q, D], got {tuple(gate_scores.shape)}")
+        if gate_logits is not None and gate_logits.shape != gate_scores.shape:
+            raise ValueError(
+                "gate_logits must match gate_scores shape; "
+                f"got {tuple(gate_logits.shape)} vs {tuple(gate_scores.shape)}"
+            )
+
+        if gate_scores.shape[1] == 0:
+            zero = gate_scores.new_zeros((gate_scores.shape[0],))
+            return [
+                {
+                    "gate_mean": 0.0,
+                    "gate_max": 0.0,
+                    "gate_abs_mean": 0.0,
+                    "gate_abs_max": 0.0,
+                    "gate_logit_mean": 0.0,
+                    "gate_logit_abs_max": 0.0,
+                    "gate_layer_query_mean": [],
+                    "gate_logit_layer_query_mean": [],
+                }
+                for _ in zero
+            ]
+
+        gate_mean = gate_scores.mean(dim=(1, 2, 3))
+        gate_max = gate_scores.amax(dim=(1, 2, 3))
+        gate_layer_query_mean = gate_scores.mean(dim=-1)
+
+        if gate_logits is None:
+            gate_logit_mean = gate_scores.new_zeros((gate_scores.shape[0],))
+            gate_logit_abs_max = gate_scores.new_zeros((gate_scores.shape[0],))
+            gate_logit_layer_query_mean = gate_scores.new_zeros(gate_scores.shape[:3])
+        else:
+            gate_logit_mean = gate_logits.mean(dim=(1, 2, 3))
+            gate_logit_abs_max = gate_logits.abs().amax(dim=(1, 2, 3))
+            gate_logit_layer_query_mean = gate_logits.mean(dim=-1)
+
+        return [
+            {
+                "gate_mean": float(mean.item()),
+                "gate_max": float(maximum.item()),
+                "gate_abs_mean": float(mean.item()),
+                "gate_abs_max": float(maximum.item()),
+                "gate_logit_mean": float(logit_mean.item()),
+                "gate_logit_abs_max": float(logit_abs_max.item()),
+                "gate_layer_query_mean": layer_query_mean.detach().cpu().tolist(),
+                "gate_logit_layer_query_mean": logit_layer_query_mean.detach().cpu().tolist(),
+            }
+            for mean, maximum, logit_mean, logit_abs_max, layer_query_mean, logit_layer_query_mean in zip(
+                gate_mean,
+                gate_max,
+                gate_logit_mean,
+                gate_logit_abs_max,
+                gate_layer_query_mean,
+                gate_logit_layer_query_mean,
+            )
+        ]
+
     profiler_inputs = profiler_tokenizer(
         list(clean_prompt_texts),
         return_tensors="pt",
@@ -421,10 +483,11 @@ def generate_pec_responses(
     )
     composer_inputs = move_tokenized_batch(composer_inputs, device)
 
-    soft_prompts, gate_scores = model.encode_soft_prompts(
+    soft_prompts, gate_scores, gate_logits = model.encode_soft_prompts(
         profiler_input_ids=profiler_inputs["input_ids"],
         profiler_attention_mask=profiler_inputs["attention_mask"],
         return_gate_scores=True,
+        return_gate_logits=True,
     )
 
     text_embeds = model.composer.get_input_embeddings()(composer_inputs["input_ids"])
@@ -490,22 +553,7 @@ def generate_pec_responses(
     else:
         generated_texts = ["" for _ in clean_prompt_texts]
 
-    gate_scores_abs = gate_scores.abs()
-    if gate_scores_abs.ndim <= 1:
-        gate_abs_mean = gate_scores_abs.reshape(-1)
-        gate_abs_max = gate_scores_abs.reshape(-1)
-    else:
-        reduce_dims = tuple(range(1, gate_scores_abs.ndim))
-        gate_abs_mean = gate_scores_abs.mean(dim=reduce_dims)
-        gate_abs_max = gate_scores_abs.amax(dim=reduce_dims)
-
-    gate_stats = [
-        {
-            "gate_abs_mean": float(abs_mean.item()),
-            "gate_abs_max": float(abs_max.item()),
-        }
-        for abs_mean, abs_max in zip(gate_abs_mean, gate_abs_max)
-    ]
+    gate_stats = summarize_gated_attention(gate_scores, gate_logits)
     return generated_texts, gate_stats
 
 
@@ -584,7 +632,7 @@ def build_re2_prediction_record(
     example: Dict[str, Any],
     input_prompt: str,
     raw_prediction: str,
-    gate_stats: Dict[str, float] | None = None,
+    gate_stats: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     cleaned_prediction = strip_thinking_trace(raw_prediction)
     strict_parsed_prediction = parse_re2_answer(
