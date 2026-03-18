@@ -1,20 +1,154 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import random
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from torch.utils.data import ConcatDataset, Dataset, Subset
-from datasets import Dataset as HFDataset
-from datasets import load_dataset
-from huggingface_hub import snapshot_download
+
+try:
+    from datasets import Dataset as HFDataset
+    from datasets import load_dataset
+except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
+    HFDataset = Any
+    load_dataset = None
+
+try:
+    from huggingface_hub import snapshot_download
+except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
+    snapshot_download = None
 
 
 
 PromptAnswerSample = Dict[str, str]
+LONG_MAGPIE_FILTER_CACHE_VERSION = 1
+
+
+def _is_primary_dataset_process() -> bool:
+    rank = os.environ.get("RANK")
+    return rank is None or rank == "0"
+
+
+def _dataset_log(message: str) -> None:
+    if not _is_primary_dataset_process():
+        return
+
+    rank = os.environ.get("RANK")
+    prefix = "[dataset]" if rank is None else f"[dataset rank={rank}]"
+    print(f"{prefix} {message}", flush=True)
+
+
+def _dataset_cache_root() -> Path:
+    override = os.environ.get("PEC_DATASET_CACHE_DIR")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent.parent / ".cache" / "pec_datasets"
+
+
+def _long_magpie_filter_cache_dir() -> Path:
+    return _dataset_cache_root() / "long_magpie_filters"
+
+
+def _distributed_world_size() -> int:
+    try:
+        return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
+    except ValueError:
+        return 1
+
+
+def _build_long_magpie_filter_cache_metadata(
+    *,
+    dataset: Dataset,
+    max_profiler_tokens: int,
+    max_composer_tokens: int,
+    profiler_tokenizer_name: str,
+    composer_tokenizer_name: str,
+) -> Dict[str, Any]:
+    dataset_fingerprint = getattr(dataset, "_fingerprint", None)
+    if dataset_fingerprint is None:
+        dataset_fingerprint = f"{dataset.__class__.__name__}:{len(dataset)}"
+
+    return {
+        "cache_version": LONG_MAGPIE_FILTER_CACHE_VERSION,
+        "dataset_fingerprint": str(dataset_fingerprint),
+        "dataset_rows": int(len(dataset)),
+        "max_profiler_tokens": int(max_profiler_tokens),
+        "max_composer_tokens": int(max_composer_tokens),
+        "profiler_tokenizer_name": str(profiler_tokenizer_name),
+        "composer_tokenizer_name": str(composer_tokenizer_name),
+    }
+
+
+def _long_magpie_filter_cache_path(cache_metadata: Dict[str, Any]) -> Path:
+    cache_key = hashlib.sha256(
+        json.dumps(cache_metadata, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:24]
+    return _long_magpie_filter_cache_dir() / f"{cache_key}.json"
+
+
+def _load_long_magpie_filter_cache(
+    cache_path: Path,
+    *,
+    cache_metadata: Dict[str, Any],
+) -> Optional[List[int]]:
+    if not cache_path.exists():
+        return None
+
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if payload.get("cache_metadata") != cache_metadata:
+        return None
+
+    kept_indices = payload.get("kept_indices")
+    if not isinstance(kept_indices, list):
+        return None
+    if not all(isinstance(index, int) for index in kept_indices):
+        return None
+    return kept_indices
+
+
+def _save_long_magpie_filter_cache(
+    cache_path: Path,
+    *,
+    cache_metadata: Dict[str, Any],
+    kept_indices: List[int],
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "cache_metadata": cache_metadata,
+        "kept_indices": kept_indices,
+    }
+    temp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp.{os.getpid()}")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+    temp_path.replace(cache_path)
+
+
+def _wait_for_long_magpie_filter_cache(
+    cache_path: Path,
+    *,
+    cache_metadata: Dict[str, Any],
+    timeout_seconds: float = 1800.0,
+    poll_interval_seconds: float = 5.0,
+) -> Optional[List[int]]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        kept_indices = _load_long_magpie_filter_cache(
+            cache_path,
+            cache_metadata=cache_metadata,
+        )
+        if kept_indices is not None:
+            return kept_indices
+        time.sleep(poll_interval_seconds)
+    return None
 
 
 @dataclass(frozen=True)
@@ -193,12 +327,51 @@ def build_long_magpie_subset_with_length_limit(
     batch_size: int = 256,
 ) -> Subset:
     """Builds a deterministic subset of LongMagpie samples under tokenizer budgets."""
+    cache_metadata = _build_long_magpie_filter_cache_metadata(
+        dataset=dataset,
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
+        profiler_tokenizer_name=profiler_tokenizer_name,
+        composer_tokenizer_name=composer_tokenizer_name,
+    )
+    cache_path = _long_magpie_filter_cache_path(cache_metadata)
+    cached_indices = _load_long_magpie_filter_cache(
+        cache_path,
+        cache_metadata=cache_metadata,
+    )
+    if cached_indices is not None:
+        _dataset_log(
+            f"Reusing cached LongMagpie filter: {cache_path} "
+            f"(kept={len(cached_indices)}/{len(dataset)})"
+        )
+        return Subset(dataset, cached_indices)
+
+    should_wait_for_primary_cache = _distributed_world_size() > 1 and not _is_primary_dataset_process()
+    if should_wait_for_primary_cache:
+        cached_indices = _wait_for_long_magpie_filter_cache(
+            cache_path,
+            cache_metadata=cache_metadata,
+        )
+        if cached_indices is not None:
+            return Subset(dataset, cached_indices)
+
     profiler_tokenizer, composer_tokenizer = _get_long_context_filter_tokenizers(
         profiler_tokenizer_name=profiler_tokenizer_name,
         composer_tokenizer_name=composer_tokenizer_name,
     )
+
+    total_rows = len(dataset)
+    total_batches = max(1, (total_rows + batch_size - 1) // batch_size)
+    progress_interval = max(1, total_batches // 20)
+    started_at = time.monotonic()
+    _dataset_log(
+        "Filtering LongMagpie by tokenizer length "
+        f"(rows={total_rows}, batch_size={batch_size}, "
+        f"max_profiler_tokens={max_profiler_tokens}, max_composer_tokens={max_composer_tokens})"
+    )
+
     kept_indices: List[int] = []
-    for start in range(0, len(dataset), batch_size):
+    for batch_index, start in enumerate(range(0, total_rows, batch_size), start=1):
         batch = _normalize_batch_slice(dataset[start:start + batch_size])
         prompt_answers = [format_long_magpie(sample) for sample in batch]
         prompts = [str(sample.get("prompt", "")).strip() for sample in prompt_answers]
@@ -237,6 +410,28 @@ def build_long_magpie_subset_with_length_limit(
                 continue
             if profiler_lengths[offset] <= max_profiler_tokens and composer_lengths[offset] <= max_composer_tokens:
                 kept_indices.append(start + offset)
+
+        if batch_index == 1 or batch_index % progress_interval == 0 or batch_index == total_batches:
+            processed_rows = min(start + len(batch), total_rows)
+            elapsed = max(time.monotonic() - started_at, 1e-6)
+            rows_per_second = processed_rows / elapsed
+            _dataset_log(
+                "LongMagpie filter progress: "
+                f"{processed_rows}/{total_rows} rows ({(processed_rows / total_rows) * 100:.1f}%), "
+                f"kept={len(kept_indices)}, "
+                f"speed={rows_per_second:.1f} rows/s"
+            )
+
+    _dataset_log(
+        f"LongMagpie filter complete: kept={len(kept_indices)}/{total_rows} rows "
+        f"({(len(kept_indices) / max(total_rows, 1)) * 100:.1f}%)"
+    )
+    _save_long_magpie_filter_cache(
+        cache_path,
+        cache_metadata=cache_metadata,
+        kept_indices=kept_indices,
+    )
+    _dataset_log(f"Saved LongMagpie filter cache: {cache_path}")
     return Subset(dataset, kept_indices)
 
 
@@ -420,15 +615,27 @@ def load_blended_dataset(
     if load_dataset is None:
         raise ModuleNotFoundError("The 'datasets' package is required to load blended datasets.")
 
+    _dataset_log(
+        "Loading blended datasets "
+        f"(split={split}, ratios={list(ratios)}, "
+        f"max_profiler_tokens={max_profiler_tokens}, max_composer_tokens={max_composer_tokens})"
+    )
     open_platypus_hf = load_dataset("garage-bAInd/Open-Platypus", split=split)
     long_magpie_hf = _load_long_magpie_dataset(split=split)
     no_robots_hf = load_dataset("HuggingFaceH4/no_robots", split=split)
+    _dataset_log(
+        "Source datasets loaded: "
+        f"open_platypus={len(open_platypus_hf)}, "
+        f"long_magpie={len(long_magpie_hf)}, "
+        f"no_robots={len(no_robots_hf)}"
+    )
 
     long_magpie_hf = build_long_magpie_subset_with_length_limit(
         long_magpie_hf,
         max_profiler_tokens=max_profiler_tokens,
         max_composer_tokens=max_composer_tokens,
     )
+    _dataset_log(f"LongMagpie filtered size: {len(long_magpie_hf)}")
 
     open_platypus_ds = HFDatasetAdapter(open_platypus_hf, format_open_platypus, "open_platypus")
     long_magpie_ds = HFDatasetAdapter(long_magpie_hf, format_long_magpie, "long_magpie")
@@ -456,7 +663,9 @@ def _load_long_magpie_dataset(split: str = "train") -> HFDataset:
         raise ModuleNotFoundError("The 'huggingface_hub' package is required to load LongMagpie.")
 
     repo_id = "caskcsg/LongMagpie_singledoc_longcontext_dataset"
+    _dataset_log(f"Resolving LongMagpie snapshot from Hugging Face: repo_id={repo_id}")
     snapshot_dir = snapshot_download(repo_id=repo_id, repo_type="dataset")
+    _dataset_log(f"LongMagpie snapshot ready: {snapshot_dir}")
     return load_dataset(snapshot_dir, split=split)
 
 
