@@ -65,6 +65,8 @@ class PECEngine(nn.Module):
             nn.RMSNorm(self.comp_dim, eps=1e-6)
         ) # [D_prof] -> [D_comp]
 
+        self.soft_prompt_scale = nn.Parameter(torch.tensor(0.03))
+
         self.post_extruder_norm = nn.RMSNorm(self.prof_dim, eps=1e-6)
         self.sep_token = nn.Parameter(torch.randn(1, 1, self.comp_dim))  # [1, 1, D_comp]
 
@@ -160,8 +162,10 @@ class PECEngine(nn.Module):
             gate_scores = None
             gate_logits = None
 
-        projected_input = self.post_extruder_norm(extruder_latents)
+        projected_input = self.post_extruder_norm(extruder_latents) # [B, N_q, D_prof]
         soft_prompts = self.projector(projected_input)
+        soft_prompts = self.soft_prompt_scale * soft_prompts  # [B, N_q, D_comp]
+
         return {
             "soft_prompts": soft_prompts,
             "extruder_latents": extruder_latents,
