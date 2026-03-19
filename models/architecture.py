@@ -162,7 +162,6 @@ class PECEngine(nn.Module):
 
         projected_input = self.post_extruder_norm(extruder_latents)
         soft_prompts = self.projector(projected_input)
-        soft_prompts = soft_prompts * 0.0002
         return {
             "soft_prompts": soft_prompts,
             "extruder_latents": extruder_latents,
