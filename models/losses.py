@@ -124,7 +124,15 @@ def compute_total_loss_with_gate_l1(
     gate_scores: torch.Tensor,
     lambda_current: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    l1_norm = gate_scores.abs().mean()
+    # Gate scores are stacked as [B, L, N_q, D]. Regularize only the final layer.
+    if gate_scores.ndim >= 4:
+        if gate_scores.shape[1] == 0:
+            l1_norm = gate_scores.new_zeros(())
+        else:
+            gate_scores = gate_scores[:, -1]
+            l1_norm = gate_scores.abs().mean()
+    else:
+        l1_norm = gate_scores.abs().mean()
     total_loss = standard_loss + (lambda_current * l1_norm)
     return total_loss, l1_norm
 
