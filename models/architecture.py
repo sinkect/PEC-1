@@ -60,7 +60,9 @@ class PECEngine(nn.Module):
         self.projector = nn.Sequential(
             nn.Linear(self.prof_dim, self.comp_dim),
             SwiGLU(self.comp_dim),
-            nn.Linear(self.comp_dim, self.comp_dim)
+            nn.RMSNorm(self.comp_dim, eps=1e-6),
+            nn.Linear(self.comp_dim, self.comp_dim),
+            nn.RMSNorm(self.comp_dim, eps=1e-6)
         ) # [D_prof] -> [D_comp]
 
         self.post_extruder_norm = nn.RMSNorm(self.prof_dim, eps=1e-6)
@@ -160,6 +162,7 @@ class PECEngine(nn.Module):
 
         projected_input = self.post_extruder_norm(extruder_latents)
         soft_prompts = self.projector(projected_input)
+        soft_prompts = soft_prompts * 0.0002
         return {
             "soft_prompts": soft_prompts,
             "extruder_latents": extruder_latents,
