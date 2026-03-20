@@ -102,13 +102,13 @@ class PECEngine(nn.Module):
             return True
         return any(
             bool(getattr(module, "is_gradient_checkpointing", False))
-            for module in (self.profiler, self.composer)
+            for module in (self.profiler, self.composer, self.extruder)
         )
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
         self._gradient_checkpointing_enabled = True
 
-        for module in (self.profiler, self.composer):
+        for module in (self.profiler, self.composer, self.extruder):
             method = getattr(module, "gradient_checkpointing_enable", None)
             if method is None:
                 continue
@@ -126,7 +126,7 @@ class PECEngine(nn.Module):
     def gradient_checkpointing_disable(self) -> None:
         self._gradient_checkpointing_enabled = False
 
-        for module in (self.profiler, self.composer):
+        for module in (self.profiler, self.composer, self.extruder):
             method = getattr(module, "gradient_checkpointing_disable", None)
             if method is not None:
                 method()

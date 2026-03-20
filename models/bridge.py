@@ -3,6 +3,7 @@ from einops import rearrange
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 class GroupQueryAttention(nn.Module):
     """
@@ -101,11 +102,15 @@ class AttentionBlock(nn.Module):
 
 
 class Extruder(nn.Module):
+    supports_gradient_checkpointing = True
+
     def __init__(self, hidden_size,num_query_tokens=64,  nums_layers=3, num_heads=8,
                  num_key_value_heads=2):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_query_tokens = num_query_tokens
+        self._gradient_checkpointing_enabled = False
+        self._gradient_checkpointing_kwargs = {}
 
         # Keep the original parameter name for checkpoint compatibility.
         self.query_tokens = nn.Parameter(torch.randn(1, num_query_tokens, hidden_size))
@@ -130,6 +135,18 @@ class Extruder(nn.Module):
 
         self.final_norm = nn.RMSNorm(hidden_size, eps=1e-6)
         self._init_dynamic_query()
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        return self._gradient_checkpointing_enabled
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+        self._gradient_checkpointing_enabled = True
+        self._gradient_checkpointing_kwargs = dict(gradient_checkpointing_kwargs or {})
+
+    def gradient_checkpointing_disable(self) -> None:
+        self._gradient_checkpointing_enabled = False
+        self._gradient_checkpointing_kwargs = {}
 
     def _init_dynamic_query(self) -> None:
         for module in (self.delta_mlp, self.gate_mlp):
@@ -170,6 +187,16 @@ class Extruder(nn.Module):
         gate = torch.sigmoid(self.gate_mlp(conditioning)).view(batch_size, self.num_query_tokens, 1)
         return self.query_tokens.expand(batch_size, -1, -1) + (gate * delta)
 
+    def _should_checkpoint(self, *tensors: Optional[torch.Tensor]) -> bool:
+        if not self._gradient_checkpointing_enabled or not self.training:
+            return False
+        return any(tensor is not None and tensor.requires_grad for tensor in tensors)
+
+    def _checkpoint_layer(self, layer, *args):
+        checkpoint_kwargs = dict(self._gradient_checkpointing_kwargs)
+        use_reentrant = checkpoint_kwargs.pop("use_reentrant", False)
+        return checkpoint(layer, *args, use_reentrant=use_reentrant, **checkpoint_kwargs)
+
     def forward(
         self,
         context: torch.Tensor,
@@ -196,14 +223,42 @@ class Extruder(nn.Module):
         collected_gate_scores = []
         collected_gate_logits = []
         for layer in self.layers:
+            should_checkpoint = self._should_checkpoint(latents, context)
             if return_gate_scores:
-                layer_outputs = layer(
-                    latents,
-                    context,
-                    attn_mask=attn_mask,
-                    return_gate=True,
-                    return_gate_logits=return_gate_logits,
-                )
+                if should_checkpoint:
+                    if attn_mask is None:
+                        def layer_forward(current_latents: torch.Tensor, current_context: torch.Tensor):
+                            return layer(
+                                current_latents,
+                                current_context,
+                                return_gate=True,
+                                return_gate_logits=return_gate_logits,
+                            )
+
+                        layer_outputs = self._checkpoint_layer(layer_forward, latents, context)
+                    else:
+                        def layer_forward(
+                            current_latents: torch.Tensor,
+                            current_context: torch.Tensor,
+                            current_attn_mask: torch.Tensor,
+                        ):
+                            return layer(
+                                current_latents,
+                                current_context,
+                                attn_mask=current_attn_mask,
+                                return_gate=True,
+                                return_gate_logits=return_gate_logits,
+                            )
+
+                        layer_outputs = self._checkpoint_layer(layer_forward, latents, context, attn_mask)
+                else:
+                    layer_outputs = layer(
+                        latents,
+                        context,
+                        attn_mask=attn_mask,
+                        return_gate=True,
+                        return_gate_logits=return_gate_logits,
+                    )
                 if return_gate_logits:
                     latents, gate_scores, gate_logits = layer_outputs
                     collected_gate_logits.append(gate_logits)  # each: [B, N_q, D]
@@ -211,7 +266,23 @@ class Extruder(nn.Module):
                     latents, gate_scores = layer_outputs
                 collected_gate_scores.append(gate_scores)  # each: [B, N_q, D]
             else:
-                latents = layer(latents, context, attn_mask=attn_mask)
+                if should_checkpoint:
+                    if attn_mask is None:
+                        def layer_forward(current_latents: torch.Tensor, current_context: torch.Tensor):
+                            return layer(current_latents, current_context)
+
+                        latents = self._checkpoint_layer(layer_forward, latents, context)
+                    else:
+                        def layer_forward(
+                            current_latents: torch.Tensor,
+                            current_context: torch.Tensor,
+                            current_attn_mask: torch.Tensor,
+                        ):
+                            return layer(current_latents, current_context, attn_mask=current_attn_mask)
+
+                        latents = self._checkpoint_layer(layer_forward, latents, context, attn_mask)
+                else:
+                    latents = layer(latents, context, attn_mask=attn_mask)
 
         latents = self.final_norm(latents)  # [B, N_q, D]
 

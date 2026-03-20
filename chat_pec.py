@@ -13,6 +13,7 @@ EXIT_COMMANDS = {"/exit", "/quit", "exit", "quit"}
 MULTILINE_START_COMMANDS = {"/multiline", "/paste"}
 MULTILINE_SEND_COMMANDS = {"/send", "/submit", "/end"}
 MULTILINE_CANCEL_COMMANDS = {"/cancel", "/abort"}
+SOFT_PROMPT_SCALE_COMMANDS = {"/scale", "/soft-prompt-scale"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-id", type=int, default=None, help="CUDA GPU id to use. Defaults to current auto-detected device.")
     parser.add_argument("--show-raw", action="store_true", help="Print raw output even when it matches cleaned output.")
     parser.add_argument("--prompt", type=str, default=None, help="Run a single prompt once without interactive chat.")
+    parser.add_argument(
+        "--soft-prompt-scale",
+        type=float,
+        default=None,
+        help="Override PEC model soft_prompt_scale after loading for quick chat-time testing.",
+    )
 
     mask_group = parser.add_mutually_exclusive_group()
     mask_group.add_argument("--apply-mask", dest="apply_mask", action="store_true", help="Mask the composer-visible prompt like PEC masked eval.")
@@ -79,7 +86,27 @@ def resolve_device(gpu_id: int | None) -> torch.device:
     return get_device()
 
 
-def print_header(args: argparse.Namespace, device: torch.device, sampling: dict[str, float]) -> None:
+def get_soft_prompt_scale(model) -> float | None:
+    if model is None or not hasattr(model, "soft_prompt_scale"):
+        return None
+    return float(model.soft_prompt_scale.detach().item())
+
+
+def set_soft_prompt_scale(model, value: float) -> float:
+    if model is None or not hasattr(model, "soft_prompt_scale"):
+        raise ValueError("PEC model does not expose soft_prompt_scale.")
+
+    with torch.no_grad():
+        model.soft_prompt_scale.fill_(float(value))
+    return get_soft_prompt_scale(model)
+
+
+def print_header(
+    args: argparse.Namespace,
+    device: torch.device,
+    sampling: dict[str, float],
+    pec_soft_prompt_scale: float | None = None,
+) -> None:
     from models.eval_utils import thinking_mode_name
 
     print("Interactive chat ready.", flush=True)
@@ -103,7 +130,9 @@ def print_header(args: argparse.Namespace, device: torch.device, sampling: dict[
     if args.mode in {"pec", "compare"}:
         print(f"  PEC checkpoint: {args.pec_checkpoint_dir}", flush=True)
         print(f"  PEC composer model: {args.pec_composer_model}", flush=True)
-    print("  Commands: /help, /multiline, /reset, /exit", flush=True)
+        if pec_soft_prompt_scale is not None:
+            print(f"  Soft prompt scale: {pec_soft_prompt_scale:.6f}", flush=True)
+    print("  Commands: /help, /multiline, /reset, /scale [value], /exit", flush=True)
 
 
 def print_response_block(
@@ -116,6 +145,7 @@ def print_response_block(
     elapsed_seconds: float,
     gate_stats: dict[str, Any] | None = None,
     show_raw: bool = False,
+    soft_prompt_scale: float | None = None,
 ) -> None:
     def print_layer_query_table(title: str, layer_query_values: list[list[float]]) -> None:
         if not layer_query_values:
@@ -153,6 +183,8 @@ def print_response_block(
     print(f"  Prediction: {cleaned_prediction}", flush=True)
     if show_raw or raw_prediction != cleaned_prediction:
         print(f"  Raw prediction: {raw_prediction}", flush=True)
+    if soft_prompt_scale is not None:
+        print(f"  Soft prompt scale: {soft_prompt_scale:.6f}", flush=True)
     if gate_stats is not None:
         print(
             f"  Gate score: mean={gate_stats['gate_mean']:.6f}, "
@@ -183,6 +215,7 @@ def print_help() -> None:
     print("  /help  Show commands", flush=True)
     print("  /multiline  Enter multiline input mode; finish with /send or discard with /cancel", flush=True)
     print("  /reset Reset the turn counter used for deterministic masking", flush=True)
+    print("  /scale [value]  Show current PEC soft prompt scale or set it for subsequent turns", flush=True)
     print("  /exit  Quit", flush=True)
 
 
@@ -324,6 +357,7 @@ def run_one_turn(
             elapsed_seconds=pec_elapsed,
             gate_stats=gate_stats,
             show_raw=args.show_raw,
+            soft_prompt_scale=get_soft_prompt_scale(pec_model),
         )
 
 
@@ -361,10 +395,17 @@ def main() -> None:
                 num_query_tokens=args.num_query_tokens,
                 device=device,
             )
+            if args.soft_prompt_scale is not None:
+                set_soft_prompt_scale(pec_model, args.soft_prompt_scale)
             if args.apply_mask:
                 masker = EntityMasker(mask_prob=args.mask_probability)
 
-        print_header(args, device, sampling)
+        print_header(
+            args,
+            device,
+            sampling,
+            pec_soft_prompt_scale=get_soft_prompt_scale(pec_model),
+        )
 
         if args.prompt is not None:
             run_one_turn(
@@ -423,6 +464,25 @@ def main() -> None:
             if command == "/reset":
                 turn_index = 0
                 print("Turn counter reset.", flush=True)
+                continue
+            if command.split(maxsplit=1)[0] in SOFT_PROMPT_SCALE_COMMANDS:
+                if pec_model is None:
+                    print("Soft prompt scale is only available in PEC/compare mode.", flush=True)
+                    continue
+
+                parts = command.split(maxsplit=1)
+                if len(parts) == 1:
+                    current_value = get_soft_prompt_scale(pec_model)
+                    print(f"Current soft prompt scale: {current_value:.6f}", flush=True)
+                    continue
+
+                try:
+                    updated_value = set_soft_prompt_scale(pec_model, float(parts[1]))
+                except ValueError:
+                    print("Usage: /scale <float>", flush=True)
+                    continue
+
+                print(f"Soft prompt scale updated to {updated_value:.6f}", flush=True)
                 continue
             if command in MULTILINE_START_COMMANDS:
                 user_input = read_multiline_input()
