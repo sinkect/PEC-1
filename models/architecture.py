@@ -31,6 +31,7 @@ class PECEngine(nn.Module):
             num_query_tokens=64,
             freeze_profiler=False,
             freeze_composer=True,
+            freeze_extruder=False,
 
     ):
         super().__init__()
@@ -56,14 +57,15 @@ class PECEngine(nn.Module):
             hidden_size=self.prof_dim,
             num_query_tokens=num_query_tokens
         )  # [B, S_doc, D_prof] -> [B, N_q, D_prof]
+        if freeze_extruder:
+            self.extruder.requires_grad_(False)
 
         self.projector = nn.Sequential(
             nn.Linear(self.prof_dim, self.comp_dim),
             SwiGLU(self.comp_dim),
             nn.RMSNorm(self.comp_dim, eps=1e-6),
-            nn.Linear(self.comp_dim, self.comp_dim),
-            nn.RMSNorm(self.comp_dim, eps=1e-6)
-        ) # [D_prof] -> [D_comp]
+            nn.Linear(self.comp_dim, self.comp_dim)
+        ).to(dtype=torch.bfloat16) # [D_prof] -> [D_comp]
 
         self.soft_prompt_scale = nn.Parameter(torch.tensor(0.03))
 

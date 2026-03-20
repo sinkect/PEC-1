@@ -80,6 +80,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1-kd-temperature", type=float, default=2.0)
     parser.add_argument("--process-name", type=str, default="pec_training")
     parser.add_argument("--num-query-tokens", type=int, default=64)
+    parser.add_argument(
+        "--freeze-profiler",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--freeze-extruder",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--num-train-epochs", type=float, default=2.0)
     parser.add_argument(
         "--gradient-checkpoint",
@@ -522,6 +532,8 @@ def main() -> None:
         profiler_path=str(args.profiler_model_path),
         composer_path=args.composer_model_name,
         num_query_tokens=args.num_query_tokens,
+        freeze_profiler=args.freeze_profiler,
+        freeze_extruder=args.freeze_extruder,
     )
     if args.init_from_checkpoint is not None:
         initialize_model_from_checkpoint(model, args.init_from_checkpoint)
