@@ -99,6 +99,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per-device-train-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=5e-4)
+    parser.add_argument(
+        "--extruder-learning-rate",
+        type=float,
+        default=None,
+        help="Optional override for Extruder LR. Defaults to --learning-rate when unset.",
+    )
+    parser.add_argument(
+        "--projector-learning-rate",
+        type=float,
+        default=None,
+        help="Optional override for Projector LR. Defaults to --learning-rate when unset.",
+    )
     parser.add_argument("--profiler-learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-steps", type=int, default=100)
@@ -373,17 +385,24 @@ def build_training_arguments(args: argparse.Namespace, output_dir: Path, device:
 
 
 def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.Optimizer:
+    extruder_learning_rate = (
+        args.extruder_learning_rate if args.extruder_learning_rate is not None else args.learning_rate
+    )
+    projector_learning_rate = (
+        args.projector_learning_rate if args.projector_learning_rate is not None else args.learning_rate
+    )
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if "profiler" in n and p.requires_grad],
             "lr": args.profiler_learning_rate,
         },
         {
-            "params": [
-                p for n, p in model.named_parameters()
-                if ("extruder" in n or "projector" in n) and p.requires_grad
-            ],
-            "lr": args.learning_rate,
+            "params": [p for n, p in model.named_parameters() if "extruder" in n and p.requires_grad],
+            "lr": extruder_learning_rate,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "projector" in n and p.requires_grad],
+            "lr": projector_learning_rate,
         },
     ]
     return torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=args.weight_decay)
