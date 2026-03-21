@@ -24,6 +24,13 @@ class KnowledgeDistillationConfig:
     temperature: float = 2.0
 
 
+@dataclass(frozen=True)
+class ProjectorRawL2Config:
+    """Configuration for projector_raw L2 regularization."""
+
+    lambda_value: float = 0.0
+
+
 def _resolve_max_steps(trainer: Trainer) -> int:
     max_steps = int(getattr(trainer.state, "max_steps", 0) or 0)
     if max_steps <= 0:
@@ -137,12 +144,17 @@ def compute_total_loss_with_gate_l1(
     return total_loss, l1_norm
 
 
+def compute_projector_raw_l2_loss(projector_raw: torch.Tensor) -> torch.Tensor:
+    return projector_raw.float().square().mean()
+
+
 def trainer_compute_loss_with_gate_l1(
     trainer: Trainer,
     model: torch.nn.Module,
     inputs: Dict[str, Any],
     config: Optional[GateL1WarmupConfig] = None,
     kd_config: Optional[KnowledgeDistillationConfig] = None,
+    projector_raw_l2_config: Optional[ProjectorRawL2Config] = None,
     teacher_model: Optional[torch.nn.Module] = None,
     return_outputs: bool = False,
 ) -> Any:
@@ -150,10 +162,17 @@ def trainer_compute_loss_with_gate_l1(
         config = GateL1WarmupConfig()
     if kd_config is None:
         kd_config = KnowledgeDistillationConfig()
+    if projector_raw_l2_config is None:
+        projector_raw_l2_config = ProjectorRawL2Config()
 
     student_inputs, teacher_inputs = _split_student_teacher_inputs(inputs)
     needs_student_logits = teacher_model is not None and teacher_inputs and kd_config.lambda_value > 0.0
-    outputs = model(**student_inputs, return_logits=needs_student_logits)
+    needs_projector_raw = projector_raw_l2_config.lambda_value > 0.0
+    outputs = model(
+        **student_inputs,
+        return_logits=needs_student_logits,
+        return_projector_raw=needs_projector_raw,
+    )
 
     standard_loss = outputs["loss"]
     if standard_loss is None:
@@ -170,6 +189,14 @@ def trainer_compute_loss_with_gate_l1(
         lambda_current=lambda_current,
     )
     outputs["gate_l1_loss"] = gate_l1_loss.detach()
+
+    if projector_raw_l2_config.lambda_value > 0.0:
+        projector_raw = outputs.get("projector_raw")
+        if projector_raw is None:
+            raise ValueError("Model outputs must contain 'projector_raw' when projector_raw L2 is enabled.")
+        projector_raw_l2_loss = compute_projector_raw_l2_loss(projector_raw)
+        total_loss = total_loss + (projector_raw_l2_config.lambda_value * projector_raw_l2_loss)
+        outputs["projector_raw_l2_loss"] = projector_raw_l2_loss.detach()
 
     if teacher_model is not None and teacher_inputs and kd_config.lambda_value > 0.0:
         teacher_model.eval()
@@ -204,6 +231,7 @@ class GateL1Trainer(Trainer):
         *args: Any,
         gate_l1_max_lambda: float = 1e-3,
         gate_l1_warmup_ratio: float = 0.1,
+        projector_raw_l2_lambda: float = 0.0,
         teacher_model: Optional[torch.nn.Module] = None,
         distill_kl_lambda: float = 0.0,
         distill_kl_temperature: float = 1.0,
@@ -214,6 +242,7 @@ class GateL1Trainer(Trainer):
             max_lambda=gate_l1_max_lambda,
             warmup_ratio=gate_l1_warmup_ratio,
         )
+        self.projector_raw_l2_config = ProjectorRawL2Config(lambda_value=projector_raw_l2_lambda)
         self.kd_config = KnowledgeDistillationConfig(
             lambda_value=distill_kl_lambda,
             temperature=distill_kl_temperature,
@@ -237,6 +266,7 @@ class GateL1Trainer(Trainer):
             inputs=inputs,
             config=self.gate_l1_config,
             kd_config=self.kd_config,
+            projector_raw_l2_config=self.projector_raw_l2_config,
             teacher_model=self.teacher_model,
             return_outputs=return_outputs,
         )

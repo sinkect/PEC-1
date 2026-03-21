@@ -43,7 +43,9 @@ try:
 		GateL1Trainer,
 		GateL1WarmupConfig,
 		KnowledgeDistillationConfig,
+		ProjectorRawL2Config,
 		compute_answer_only_kl,
+		compute_projector_raw_l2_loss,
 		compute_total_loss_with_gate_l1,
 		trainer_compute_loss_with_gate_l1,
 	)
@@ -51,7 +53,9 @@ except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
 	GateL1Trainer = None
 	GateL1WarmupConfig = None
 	KnowledgeDistillationConfig = None
+	ProjectorRawL2Config = None
 	compute_answer_only_kl = None
+	compute_projector_raw_l2_loss = None
 	compute_total_loss_with_gate_l1 = None
 	trainer_compute_loss_with_gate_l1 = None
 
@@ -75,7 +79,9 @@ __all__ = [
 	"GateL1Trainer",
 	"GateL1WarmupConfig",
 	"KnowledgeDistillationConfig",
+	"ProjectorRawL2Config",
 	"compute_answer_only_kl",
+	"compute_projector_raw_l2_loss",
 	"compute_total_loss_with_gate_l1",
 	"trainer_compute_loss_with_gate_l1",
 ]

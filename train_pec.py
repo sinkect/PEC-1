@@ -110,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-patience", type=int, default=2)
     parser.add_argument("--gate-l1-max-lambda", type=float, default=2e-4)
     parser.add_argument("--gate-l1-warmup-ratio", type=float, default=0.3)
+    parser.add_argument("--projector-raw-l2-lambda", type=float, default=1e-5)
     parser.add_argument("--max-profiler-len", type=int, default=6080)
     parser.add_argument("--max-composer-len", type=int, default=6080)
     return parser.parse_args()
@@ -611,6 +612,7 @@ def main() -> None:
             optimizers=(optimizer, None),
             gate_l1_max_lambda=args.gate_l1_max_lambda,
             gate_l1_warmup_ratio=args.gate_l1_warmup_ratio,
+            projector_raw_l2_lambda=args.projector_raw_l2_lambda,
             teacher_model=teacher_model if stage.include_teacher else None,
             distill_kl_lambda=args.stage1_kd_lambda if stage.include_teacher else 0.0,
             distill_kl_temperature=args.stage1_kd_temperature if stage.include_teacher else 1.0,

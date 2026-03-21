@@ -200,6 +200,7 @@ class PECEngine(nn.Module):
             composer_attention_mask,
             labels=None,
             return_logits: bool = False,
+            return_projector_raw: bool = False,
     ):
         """
         New Forward Logic for Dynamic Masking Pipeline.
@@ -213,11 +214,14 @@ class PECEngine(nn.Module):
         device = self.composer.device
 
         # --- [Phase 1] Profiler & Extruder (Compression) ---
-        soft_prompts, gate_scores, _ = self.encode_soft_prompts(
+        artifacts = self.build_soft_prompt_artifacts(
             profiler_input_ids=profiler_input_ids,
             profiler_attention_mask=profiler_attention_mask,
             return_gate_scores=True,
         )
+        soft_prompts = artifacts["soft_prompts"]
+        gate_scores = artifacts["gate_scores"]
+        projector_raw = artifacts["projector_raw"] if return_projector_raw else None
 
 
         # --- [Phase 2] Composer Input Injection ---
@@ -260,4 +264,5 @@ class PECEngine(nn.Module):
             "loss": outputs.loss,
             "logits": outputs.logits if return_logits else None,
             "gate_scores": gate_scores,
+            "projector_raw": projector_raw,
         }
