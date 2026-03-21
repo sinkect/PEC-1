@@ -206,6 +206,11 @@ def print_response_block(
             f"mean={gate_stats['soft_prompt_p_mean']:.6f}, std={gate_stats['soft_prompt_p_std']:.6f}",
             flush=True,
         )
+        print(
+            f"  projector_raw_std={gate_stats['projector_raw_std']:.6f}, "
+            f"final_P_std={gate_stats['final_p_std']:.6f}",
+            flush=True,
+        )
         print_layer_query_table("Gate score by layer/query", gate_stats["gate_layer_query_mean"])
         print_layer_query_table("Gate logits by layer/query", gate_stats["gate_logit_layer_query_mean"])
         print_tensor_slice("P[0, :5, :8]", gate_stats["soft_prompt_p_slice"])

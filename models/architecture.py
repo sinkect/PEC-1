@@ -165,13 +165,14 @@ class PECEngine(nn.Module):
             gate_logits = None
 
         projected_input = self.post_extruder_norm(extruder_latents) # [B, N_q, D_prof]
-        soft_prompts = self.projector(projected_input)
-        soft_prompts = self.soft_prompt_scale * soft_prompts  # [B, N_q, D_comp]
+        projector_raw = self.projector(projected_input)
+        soft_prompts = self.soft_prompt_scale * projector_raw  # [B, N_q, D_comp]
 
         return {
             "soft_prompts": soft_prompts,
             "extruder_latents": extruder_latents,
             "projected_input": projected_input,
+            "projector_raw": projector_raw,
             "gate_scores": gate_scores,
             "gate_logits": gate_logits,
         }

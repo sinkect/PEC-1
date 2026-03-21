@@ -405,6 +405,7 @@ def generate_pec_responses(
 
     def summarize_soft_prompt_artifacts(
         extruder_latents: torch.Tensor,
+        projector_raw: torch.Tensor,
         soft_prompts: torch.Tensor,
     ) -> List[Dict[str, Any]]:
         p_slice = soft_prompts[:, :5, :8].detach().float().cpu().tolist()
@@ -412,9 +413,16 @@ def generate_pec_responses(
             {
                 **summarize_tensor(z_sample, prefix="latent_z"),
                 **summarize_tensor(p_sample, prefix="soft_prompt_p"),
+                "projector_raw_std": float(projector_raw_sample.detach().float().std(unbiased=False).item()),
+                "final_p_std": float(p_sample.detach().float().std(unbiased=False).item()),
                 "soft_prompt_p_slice": p_head,
             }
-            for z_sample, p_sample, p_head in zip(extruder_latents, soft_prompts, p_slice)
+            for z_sample, projector_raw_sample, p_sample, p_head in zip(
+                extruder_latents,
+                projector_raw,
+                soft_prompts,
+                p_slice,
+            )
         ]
 
     def summarize_gated_attention(
@@ -513,6 +521,7 @@ def generate_pec_responses(
     )
     soft_prompts = artifacts["soft_prompts"]
     extruder_latents = artifacts["extruder_latents"]
+    projector_raw = artifacts["projector_raw"]
     gate_scores = artifacts["gate_scores"]
     gate_logits = artifacts["gate_logits"]
 
@@ -580,7 +589,7 @@ def generate_pec_responses(
         generated_texts = ["" for _ in clean_prompt_texts]
 
     gate_stats = summarize_gated_attention(gate_scores, gate_logits)
-    soft_prompt_stats = summarize_soft_prompt_artifacts(extruder_latents, soft_prompts)
+    soft_prompt_stats = summarize_soft_prompt_artifacts(extruder_latents, projector_raw, soft_prompts)
     gate_stats = [
         {
             **per_gate_stats,
