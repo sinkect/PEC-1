@@ -165,7 +165,8 @@ class PECEngine(nn.Module):
             gate_logits = None
 
         projected_input = self.post_extruder_norm(extruder_latents) # [B, N_q, D_prof]
-        projector_raw = self.projector(projected_input)
+        projector_dtype = next(self.projector.parameters()).dtype
+        projector_raw = self.projector(projected_input.to(dtype=projector_dtype))
         soft_prompts = self.soft_prompt_scale * projector_raw  # [B, N_q, D_comp]
 
         return {
@@ -173,6 +174,7 @@ class PECEngine(nn.Module):
             "extruder_latents": extruder_latents,
             "projected_input": projected_input,
             "projector_raw": projector_raw,
+            "profiler_hidden": prof_hidden,
             "gate_scores": gate_scores,
             "gate_logits": gate_logits,
         }
@@ -199,6 +201,8 @@ class PECEngine(nn.Module):
             composer_input_ids,
             composer_attention_mask,
             labels=None,
+            mh_target_input_ids_list=None,
+            mh_target_attention_mask_list=None,
             return_logits: bool = False,
             return_projector_raw: bool = False,
     ):
@@ -211,7 +215,7 @@ class PECEngine(nn.Module):
                                 (includes Instruction + Masked Context + Answer)
             labels: Masked labels for Decoder [B, Seq_Dec]
         """
-        device = self.composer.device
+        device = composer_attention_mask.device
 
         # --- [Phase 1] Profiler & Extruder (Compression) ---
         artifacts = self.build_soft_prompt_artifacts(
@@ -222,12 +226,14 @@ class PECEngine(nn.Module):
         soft_prompts = artifacts["soft_prompts"]
         gate_scores = artifacts["gate_scores"]
         projector_raw = artifacts["projector_raw"] if return_projector_raw else None
+        z_pool = artifacts["extruder_latents"].mean(dim=1)
 
 
         # --- [Phase 2] Composer Input Injection ---
         # 1. Get Embeddings of the actual text input (Qwen)
         # inputs_embeds: [B, Seq_Dec, D_comp]
         inputs_embeds = self.composer.get_input_embeddings()(composer_input_ids)
+        soft_prompts = soft_prompts.to(dtype=inputs_embeds.dtype)
 
         # 2. Prepend Soft Prompts to the text embeddings
         # Structure: [Soft Prompts] + [Instruction + Masked Context + Answer]
@@ -260,9 +266,66 @@ class PECEngine(nn.Module):
             return_dict=True,
         )
 
+        answer_loss = outputs.loss
+        mh_align_loss = self._compute_morehop_align_loss(
+            z_pool=z_pool,
+            mh_target_input_ids_list=mh_target_input_ids_list,
+            mh_target_attention_mask_list=mh_target_attention_mask_list,
+        )
+
+        total_loss = answer_loss
+        if mh_align_loss is not None:
+            total_loss = mh_align_loss * 0.1 if total_loss is None else total_loss + (0.1 * mh_align_loss)
+
         return {
-            "loss": outputs.loss,
+            "loss": total_loss,
+            "answer_loss": answer_loss,
+            "mh_align_loss": mh_align_loss,
             "logits": outputs.logits if return_logits else None,
             "gate_scores": gate_scores,
             "projector_raw": projector_raw,
         }
+
+    def _compute_morehop_align_loss(
+            self,
+            *,
+            z_pool: torch.Tensor,
+            mh_target_input_ids_list: list[torch.Tensor] | None,
+            mh_target_attention_mask_list: list[torch.Tensor] | None,
+    ):
+        if not mh_target_input_ids_list or not mh_target_attention_mask_list:
+            return None
+
+        total_loss = z_pool.new_zeros(())
+        total_pairs = 0
+
+        for target_input_ids, target_attention_mask in zip(
+            mh_target_input_ids_list,
+            mh_target_attention_mask_list,
+        ):
+            active_rows = torch.any(target_attention_mask.bool(), dim=1)
+            if not torch.any(active_rows):
+                continue
+
+            target_outputs = self.profiler(
+                input_ids=target_input_ids,
+                attention_mask=target_attention_mask,
+            )
+            target_hidden = target_outputs.last_hidden_state
+
+            mask = target_attention_mask.unsqueeze(-1).to(dtype=target_hidden.dtype)
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            r_k = (target_hidden * mask).sum(dim=1) / denom
+
+            similarities = F.cosine_similarity(
+                z_pool[active_rows].float(),
+                r_k[active_rows].float(),
+                dim=-1,
+            )
+            total_loss = total_loss + (1.0 - similarities).sum()
+            total_pairs += int(active_rows.sum().item())
+
+        if total_pairs == 0:
+            return None
+
+        return total_loss / total_pairs

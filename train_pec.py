@@ -1,5 +1,4 @@
 import argparse
-import gc
 import json
 import os
 import shutil
@@ -9,10 +8,10 @@ from typing import Dict, Any, List, Optional
 
 import torch
 from safetensors.torch import load_file as load_safetensors
+import setproctitle
 from torch.utils.data import Dataset, Subset
 
 from transformers import (
-    AutoModelForCausalLM,
     AutoTokenizer,
     EarlyStoppingCallback,
     TrainerCallback,
@@ -23,20 +22,18 @@ from models.architecture import PECEngine
 from models.data import PECDataset, PECCollator, EntityMasker, SharedMaskProbability
 from models.dataset_mixing import (
     BlendResult,
-    load_stage1_kd_blended_dataset,
+    load_stage1_blended_dataset,
     load_stage23_blended_dataset,
     save_blend_metadata,
     save_sampled_by_source_as_jsonl,
 )
 from models.losses import GateL1Trainer
-import setproctitle
 
 
 @dataclass(frozen=True)
 class StageSpec:
     name: str
     visible_prompt_mode: str
-    include_teacher: bool
     train_samples: int
     with_replacement: bool
     mask_prob_start: Optional[float] = None
@@ -45,7 +42,7 @@ class StageSpec:
 
 def parse_args() -> argparse.Namespace:
     base_dir = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="Train PEC with stage-aware masking and Stage 1 KD.")
+    parser = argparse.ArgumentParser(description="Train PEC with stage-aware masking.")
     parser.add_argument("--output-dir", type=Path, default=base_dir / "outputs" / "PEC")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--init-from-checkpoint", type=Path, default=None)
@@ -76,8 +73,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--stage23-mask-prob-start", type=float, default=None)
     parser.add_argument("--stage23-mask-prob-end", type=float, default=None)
-    parser.add_argument("--stage1-kd-lambda", type=float, default=0.3)
-    parser.add_argument("--stage1-kd-temperature", type=float, default=2.0)
     parser.add_argument("--process-name", type=str, default="pec_training")
     parser.add_argument("--num-query-tokens", type=int, default=64)
     parser.add_argument(
@@ -141,25 +136,9 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def get_model_dtype(device: torch.device) -> torch.dtype:
-    if device.type == "cuda":
-        return torch.bfloat16
-    if device.type == "mps":
-        return torch.float16
-    return torch.float32
-
-
 def ensure_tokenizer_padding(tokenizer) -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-
-def clear_memory() -> None:
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
 
 
 class BlendedMessagesToPECSamples(Dataset):
@@ -173,11 +152,18 @@ class BlendedMessagesToPECSamples(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.base_dataset[idx]
-        return {
+        normalized = {
             "prompt": str(sample.get("prompt", "")).strip(),
             "answer": str(sample.get("answer", "")).strip(),
             "source": sample.get("source", ""),
         }
+        for key in (
+            "task_type",
+            "mh_target_texts",
+        ):
+            if key in sample:
+                normalized[key] = sample[key]
+        return normalized
 
 
 def split_dataset_indices(dataset_len: int, test_size: float = 0.02, seed: int = 42) -> Dict[str, List[int]]:
@@ -217,7 +203,6 @@ def get_stage_specs(args: argparse.Namespace) -> Dict[str, StageSpec]:
         "stage1": StageSpec(
             name="stage1",
             visible_prompt_mode="empty",
-            include_teacher=True,
             train_samples=args.stage1_train_samples,
             with_replacement=False,
             mask_prob_start=None,
@@ -226,7 +211,6 @@ def get_stage_specs(args: argparse.Namespace) -> Dict[str, StageSpec]:
         "stage23": StageSpec(
             name="stage23",
             visible_prompt_mode="masked",
-            include_teacher=False,
             train_samples=args.stage23_train_samples,
             with_replacement=True,
             mask_prob_start=stage23_mask_prob_start,
@@ -286,7 +270,7 @@ def load_blend_for_stage(
         max_composer_tokens: int,
 ) -> BlendResult:
     if stage.name == "stage1":
-        return load_stage1_kd_blended_dataset(
+        return load_stage1_blended_dataset(
             split="train",
             seed=seed,
             epoch_size=stage.train_samples,
@@ -336,8 +320,6 @@ def build_stage_datasets(
         composer_tokenizer=composer_tokenizer,
         composer_enable_thinking=False,
         visible_prompt_mode=stage.visible_prompt_mode,
-        include_teacher=stage.include_teacher,
-        teacher_visible_prompt_mode="full",
     )
     eval_dataset = PECDataset(
         data=eval_base,
@@ -345,8 +327,6 @@ def build_stage_datasets(
         composer_tokenizer=composer_tokenizer,
         composer_enable_thinking=False,
         visible_prompt_mode=stage.visible_prompt_mode,
-        include_teacher=stage.include_teacher,
-        teacher_visible_prompt_mode="full",
     )
     return train_dataset, eval_dataset, shared_mask_prob
 
@@ -391,33 +371,36 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
     projector_learning_rate = (
         args.projector_learning_rate if args.projector_learning_rate is not None else args.learning_rate
     )
+    named_parameters = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    profiler_params = [parameter for name, parameter in named_parameters if name.startswith("profiler.")]
+    extruder_params = [parameter for name, parameter in named_parameters if name.startswith("extruder.")]
+    projector_params = [parameter for name, parameter in named_parameters if name.startswith("projector.")]
+    covered_prefixes = ("profiler.", "extruder.", "projector.")
+    misc_params = [
+        parameter
+        for name, parameter in named_parameters
+        if not name.startswith(covered_prefixes)
+    ]
+
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if "profiler" in n and p.requires_grad],
+            "params": profiler_params,
             "lr": args.profiler_learning_rate,
         },
         {
-            "params": [p for n, p in model.named_parameters() if "extruder" in n and p.requires_grad],
+            "params": extruder_params,
             "lr": extruder_learning_rate,
         },
         {
-            "params": [p for n, p in model.named_parameters() if "projector" in n and p.requires_grad],
+            "params": projector_params,
             "lr": projector_learning_rate,
+        },
+        {
+            "params": misc_params,
+            "lr": args.learning_rate,
         },
     ]
     return torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=args.weight_decay)
-
-
-def load_teacher_model(model_name: str, device: torch.device, dtype: torch.dtype):
-    kwargs = {"low_cpu_mem_usage": True}
-    if device.type != "cpu":
-        kwargs["dtype"] = dtype
-
-    teacher_model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-    teacher_model.to(device)
-    teacher_model.eval()
-    teacher_model.requires_grad_(False)
-    return teacher_model
 
 
 def persist_stage_metadata(
@@ -459,12 +442,25 @@ def initialize_model_from_checkpoint(model: PECEngine, checkpoint_dir: Path) -> 
 
     critical_missing = [
         key for key in missing_keys
-        if not (key.startswith("composer.") or key.startswith("profiler."))
+        if not (
+            key.startswith("composer.")
+            or key.startswith("profiler.")
+            or key.startswith("prev_span_head.")
+            or key.startswith("expr_head.")
+        )
     ]
     if critical_missing:
         raise RuntimeError(f"Critical weights are missing from checkpoint {checkpoint_dir}: {critical_missing}")
-    if unexpected_keys:
-        raise RuntimeError(f"Unexpected keys in checkpoint {checkpoint_dir}: {unexpected_keys}")
+    filtered_unexpected_keys = [
+        key for key in unexpected_keys
+        if not (
+            key.startswith("prev_sent_head.")
+            or key.startswith("prev_span_head.")
+            or key.startswith("expr_head.")
+        )
+    ]
+    if filtered_unexpected_keys:
+        raise RuntimeError(f"Unexpected keys in checkpoint {checkpoint_dir}: {filtered_unexpected_keys}")
 
     print(f"Initialized model weights from checkpoint: {checkpoint_dir}")
 
@@ -531,7 +527,6 @@ def main() -> None:
         raise ValueError(f"--init-from-checkpoint must point to a checkpoint directory: {args.init_from_checkpoint}")
 
     device = get_device()
-    dtype = get_model_dtype(device)
     base_dir = Path(__file__).resolve().parent
     args.stages = normalize_stage_names(args.stages)
     stage_specs = get_stage_specs(args)
@@ -558,11 +553,6 @@ def main() -> None:
     if args.init_from_checkpoint is not None:
         initialize_model_from_checkpoint(model, args.init_from_checkpoint)
 
-    teacher_model = None
-    if "stage1" in args.stages:
-        print("Loading frozen Stage 1 teacher model...")
-        teacher_model = load_teacher_model(args.composer_model_name, device=device, dtype=dtype)
-
     data_collator = PECCollator(
         profiler_tokenizer=profiler_tokenizer,
         composer_tokenizer=composer_tokenizer,
@@ -581,11 +571,6 @@ def main() -> None:
             print(
                 "Composer visible prompt mask curriculum: "
                 f"{stage.mask_prob_start:.4f} -> {stage.mask_prob_end:.4f}"
-            )
-        if stage.include_teacher:
-            print(
-                "Teacher supervision: enabled "
-                f"(kl_lambda={args.stage1_kd_lambda}, temperature={args.stage1_kd_temperature})"
             )
 
         blend_result = load_blend_for_stage(
@@ -632,9 +617,6 @@ def main() -> None:
             gate_l1_max_lambda=args.gate_l1_max_lambda,
             gate_l1_warmup_ratio=args.gate_l1_warmup_ratio,
             projector_raw_l2_lambda=args.projector_raw_l2_lambda,
-            teacher_model=teacher_model if stage.include_teacher else None,
-            distill_kl_lambda=args.stage1_kd_lambda if stage.include_teacher else 0.0,
-            distill_kl_temperature=args.stage1_kd_temperature if stage.include_teacher else 1.0,
             callbacks=callbacks,
         )
 
@@ -648,11 +630,6 @@ def main() -> None:
             stage_output_dir=stage_output_dir,
             final_output_dir=stage_output_dir / "final",
         )
-
-        if stage.include_teacher and teacher_model is not None:
-            teacher_model.to("cpu")
-            teacher_model = None
-            clear_memory()
 
 
 if __name__ == "__main__":

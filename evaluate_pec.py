@@ -634,8 +634,16 @@ def load_pec_model(
     )
     state_dict = load_state_dict_from_checkpoint(checkpoint_dir)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if unexpected_keys:
-        raise RuntimeError(f"Unexpected keys in PEC checkpoint: {unexpected_keys}")
+    filtered_unexpected_keys = [
+        key for key in unexpected_keys
+        if not (
+            key.startswith("prev_sent_head.")
+            or key.startswith("prev_span_head.")
+            or key.startswith("expr_head.")
+        )
+    ]
+    if filtered_unexpected_keys:
+        raise RuntimeError(f"Unexpected keys in PEC checkpoint: {filtered_unexpected_keys}")
 
     dynamic_query_prefixes = ("extruder.delta_mlp", "extruder.gate_mlp")
     critical_missing = [

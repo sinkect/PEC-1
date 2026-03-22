@@ -1,87 +1,41 @@
-from .bridge import Extruder
+import importlib
 
-try:
-	from .architecture import PECEngine
-except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
-	PECEngine = None
 
-try:
-	from .data import PECDataset, PECCollator, EntityMasker, SharedMaskProbability
-except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
-	PECDataset = None
-	PECCollator = None
-	EntityMasker = None
-	SharedMaskProbability = None
+_EXPORT_MODULES = {
+    "Extruder": ".bridge",
+    "PECEngine": ".architecture",
+    "PECDataset": ".data",
+    "PECCollator": ".data",
+    "EntityMasker": ".data",
+    "SharedMaskProbability": ".data",
+    "BlendResult": ".dataset_mixing",
+    "HFDatasetAdapter": ".dataset_mixing",
+    "build_ratio_concat_dataset": ".dataset_mixing",
+    "load_blended_dataset": ".dataset_mixing",
+    "load_default_4_4_2_blended_dataset": ".dataset_mixing",
+    "load_stage1_blended_dataset": ".dataset_mixing",
+    "load_stage23_blended_dataset": ".dataset_mixing",
+    "save_blend_metadata": ".dataset_mixing",
+    "save_dataset_as_jsonl": ".dataset_mixing",
+    "save_sampled_by_source_as_jsonl": ".dataset_mixing",
+    "GateL1Trainer": ".losses",
+    "GateL1WarmupConfig": ".losses",
+    "ProjectorRawL2Config": ".losses",
+    "compute_projector_raw_l2_loss": ".losses",
+    "compute_total_loss_with_gate_l1": ".losses",
+    "trainer_compute_loss_with_gate_l1": ".losses",
+}
 
-try:
-	from .dataset_mixing import (
-		BlendResult,
-		HFDatasetAdapter,
-		build_ratio_concat_dataset,
-		load_blended_dataset,
-		load_default_4_4_2_blended_dataset,
-		load_stage1_kd_blended_dataset,
-		load_stage23_blended_dataset,
-		save_blend_metadata,
-		save_dataset_as_jsonl,
-		save_sampled_by_source_as_jsonl,
-	)
-except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
-	BlendResult = None
-	HFDatasetAdapter = None
-	build_ratio_concat_dataset = None
-	load_blended_dataset = None
-	load_default_4_4_2_blended_dataset = None
-	load_stage1_kd_blended_dataset = None
-	load_stage23_blended_dataset = None
-	save_blend_metadata = None
-	save_dataset_as_jsonl = None
-	save_sampled_by_source_as_jsonl = None
 
-try:
-	from .losses import (
-		GateL1Trainer,
-		GateL1WarmupConfig,
-		KnowledgeDistillationConfig,
-		ProjectorRawL2Config,
-		compute_answer_only_kl,
-		compute_projector_raw_l2_loss,
-		compute_total_loss_with_gate_l1,
-		trainer_compute_loss_with_gate_l1,
-	)
-except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
-	GateL1Trainer = None
-	GateL1WarmupConfig = None
-	KnowledgeDistillationConfig = None
-	ProjectorRawL2Config = None
-	compute_answer_only_kl = None
-	compute_projector_raw_l2_loss = None
-	compute_total_loss_with_gate_l1 = None
-	trainer_compute_loss_with_gate_l1 = None
+__all__ = list(_EXPORT_MODULES)
 
-__all__ = [
-	"Extruder",
-	"PECEngine",
-	"PECDataset",
-	"PECCollator",
-	"EntityMasker",
-	"SharedMaskProbability",
-	"BlendResult",
-	"HFDatasetAdapter",
-	"build_ratio_concat_dataset",
-	"load_blended_dataset",
-	"load_default_4_4_2_blended_dataset",
-	"load_stage1_kd_blended_dataset",
-	"load_stage23_blended_dataset",
-	"save_blend_metadata",
-	"save_dataset_as_jsonl",
-	"save_sampled_by_source_as_jsonl",
-	"GateL1Trainer",
-	"GateL1WarmupConfig",
-	"KnowledgeDistillationConfig",
-	"ProjectorRawL2Config",
-	"compute_answer_only_kl",
-	"compute_projector_raw_l2_loss",
-	"compute_total_loss_with_gate_l1",
-	"trainer_compute_loss_with_gate_l1",
-]
+
+def __getattr__(name):
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module = importlib.import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value

@@ -4,11 +4,12 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from torch.utils.data import ConcatDataset, Dataset, Subset
 
@@ -25,9 +26,9 @@ except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
     snapshot_download = None
 
 
-
-PromptAnswerSample = Dict[str, str]
+PromptAnswerSample = Dict[str, Any]
 LONG_MAGPIE_FILTER_CACHE_VERSION = 1
+HARP_DATA_URL = "https://github.com/aadityasingh/HARP/raw/main/HARP.jsonl.zip"
 
 
 def _is_primary_dataset_process() -> bool:
@@ -195,11 +196,11 @@ class HFDatasetAdapter(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         sample = self._dataset[index]
         prompt_answer = self._formatter(sample)
-        return {
-            "prompt": prompt_answer.get("prompt", ""),
-            "answer": prompt_answer.get("answer", ""),
-            "source": self._source_name,
-        }
+        normalized_sample = dict(prompt_answer)
+        normalized_sample["prompt"] = str(prompt_answer.get("prompt", "")).strip()
+        normalized_sample["answer"] = str(prompt_answer.get("answer", "")).strip()
+        normalized_sample["source"] = self._source_name
+        return normalized_sample
 
 
 def format_open_platypus(sample: Dict[str, Any]) -> PromptAnswerSample:
@@ -222,6 +223,268 @@ def format_long_magpie(sample: Dict[str, Any]) -> PromptAnswerSample:
 
     prompt = query if not context else f"{query}\n\nContext:\n{context}"
     return {"prompt": prompt, "answer": answer}
+
+
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, (list, tuple)):
+        normalized = [_normalize_text(item) for item in value]
+        return [item for item in normalized if item]
+    return []
+
+
+def _normalize_morehop_context_entries(sample: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
+    raw_context = sample.get("context")
+    if raw_context is None:
+        raw_context = sample.get("paragraphs")
+    if not isinstance(raw_context, (list, tuple)):
+        return []
+
+    normalized_entries: List[Tuple[str, List[str]]] = []
+    for entry in raw_context:
+        title = ""
+        sentences: List[str] = []
+
+        if isinstance(entry, dict):
+            title = _normalize_text(
+                entry.get("title")
+                or entry.get("paragraph_support_title")
+                or entry.get("name")
+            )
+            sentences = _normalize_string_list(
+                entry.get("sentences")
+                or entry.get("content")
+                or entry.get("paragraph")
+                or entry.get("paragraphs")
+                or entry.get("context")
+                or entry.get("text")
+            )
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            title = _normalize_text(entry[0])
+            sentences = _normalize_string_list(entry[1])
+
+        if title or sentences:
+            normalized_entries.append((title, sentences))
+    return normalized_entries
+
+
+def _extract_morehop_support_answers(sample: Dict[str, Any]) -> List[str]:
+    decomposition = sample.get("question_decomposition")
+    if not isinstance(decomposition, list):
+        return []
+
+    support_answers: List[str] = []
+    for step in decomposition:
+        if not isinstance(step, dict):
+            continue
+        support_title = _normalize_text(step.get("paragraph_support_title"))
+        if not support_title:
+            continue
+        answer = _normalize_text(step.get("answer"))
+        if answer:
+            support_answers.append(answer)
+    return support_answers
+
+
+def build_morehop_prompt(sample: Dict[str, Any]) -> str:
+    question = _normalize_text(sample.get("question"))
+    context_entries = _normalize_morehop_context_entries(sample)
+
+    prompt_parts = ["Question:\n", question, "\n\nContext:\n"]
+    prompt = "".join(prompt_parts)
+
+    for paragraph_index, (title, sentences) in enumerate(context_entries):
+        prompt += f"[{title}]\n" if title else "[Untitled]\n"
+        for sentence in sentences:
+            sentence_text = _normalize_text(sentence)
+            prompt += sentence_text
+            prompt += "\n"
+
+        if paragraph_index != len(context_entries) - 1:
+            prompt += "\n"
+
+    return prompt.strip()
+
+
+def format_morehopqa(sample: Dict[str, Any]) -> PromptAnswerSample:
+    prompt = build_morehop_prompt(sample)
+    return {
+        "prompt": prompt,
+        "answer": _normalize_text(sample.get("answer")),
+        "task_type": "morehopqa",
+        "mh_target_texts": _extract_morehop_support_answers(sample),
+    }
+
+
+def _first_non_empty(values: Sequence[Any]) -> str:
+    for value in values:
+        normalized = _normalize_text(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def _extract_nq_short_answer_text(sample: Dict[str, Any]) -> str:
+    answers = sample.get("answers")
+    if isinstance(answers, dict):
+        span_text = answers.get("span_text")
+        if isinstance(span_text, list):
+            return _first_non_empty(span_text)
+        return _normalize_text(span_text)
+    if isinstance(answers, list):
+        for answer in answers:
+            if isinstance(answer, dict):
+                answer_text = _normalize_text(answer.get("span_text") or answer.get("text"))
+                if answer_text:
+                    return answer_text
+            else:
+                answer_text = _normalize_text(answer)
+                if answer_text:
+                    return answer_text
+    return _normalize_text(sample.get("short answer") or sample.get("short_answer"))
+
+
+def format_nq_short(sample: Dict[str, Any]) -> PromptAnswerSample:
+    question = _normalize_text(sample.get("question") or sample.get("questions"))
+    context = _normalize_text(
+        sample.get("context")
+        or sample.get("contexts")
+        or sample.get("paragraph")
+        or sample.get("document_text")
+    )
+    answer = _extract_nq_short_answer_text(sample)
+    prompt = f"Question:\n{question}\n\nContext:\n{context}".strip()
+    return {
+        "prompt": prompt,
+        "answer": answer,
+        "task_type": "nq_short",
+    }
+
+
+def _find_matching_brace(text: str, start_index: int) -> Optional[int]:
+    depth = 0
+    index = start_index
+    while index < len(text):
+        character = text[index]
+        if character == "{" and (index == 0 or text[index - 1] != "\\"):
+            depth += 1
+        elif character == "}" and (index == 0 or text[index - 1] != "\\"):
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def extract_latex_math_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+
+    for pattern in (r"\\\((.*?)\\\)", r"\\\[(.*?)\\\]"):
+        for match in re.finditer(pattern, text, flags=re.DOTALL):
+            spans.append((match.start(), match.end()))
+
+    for match in re.finditer(r"\\begin\{align\*\}(.*?)\\end\{align\*\}", text, flags=re.DOTALL):
+        spans.append((match.start(), match.end()))
+
+    index = 0
+    while index < len(text):
+        if text[index] != "$" or (index > 0 and text[index - 1] == "\\"):
+            index += 1
+            continue
+        if index + 1 < len(text) and text[index + 1] == "$":
+            index += 2
+            continue
+
+        end_index = index + 1
+        while end_index < len(text):
+            if text[end_index] == "$" and text[end_index - 1] != "\\":
+                break
+            end_index += 1
+        if end_index < len(text):
+            spans.append((index, end_index + 1))
+            index = end_index + 1
+            continue
+        index += 1
+
+    boxed_pattern = re.compile(r"\\boxed\s*\{")
+    for match in boxed_pattern.finditer(text):
+        brace_start = match.end() - 1
+        brace_end = _find_matching_brace(text, brace_start)
+        if brace_end is not None:
+            spans.append((match.start(), brace_end + 1))
+
+    deduplicated_spans = sorted(set(spans))
+    return deduplicated_spans
+
+
+def _merge_overlapping_spans(spans: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    merged: List[Tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _strip_latex_target_wrappers(text: str) -> str:
+    stripped = text.strip()
+    changed = True
+    while changed and stripped:
+        changed = False
+        for prefix, suffix in (
+            ("\\(", "\\)"),
+            ("\\[", "\\]"),
+            ("\\begin{align*}", "\\end{align*}"),
+            ("$", "$"),
+        ):
+            if stripped.startswith(prefix) and stripped.endswith(suffix) and len(stripped) > len(prefix) + len(suffix):
+                stripped = stripped[len(prefix):len(stripped) - len(suffix)].strip()
+                changed = True
+                break
+        if changed:
+            continue
+
+        boxed_match = re.match(r"\\boxed\s*\{", stripped)
+        if boxed_match is None:
+            continue
+        brace_start = boxed_match.end() - 1
+        brace_end = _find_matching_brace(stripped, brace_start)
+        if brace_end == len(stripped) - 1:
+            stripped = stripped[brace_start + 1:brace_end].strip()
+            changed = True
+
+    return stripped
+
+
+def extract_latex_math_text(text: str) -> str:
+    spans = _merge_overlapping_spans(extract_latex_math_spans(text))
+    segments = [
+        _strip_latex_target_wrappers(text[start:end])
+        for start, end in spans
+    ]
+    return "\n".join(segment for segment in segments if segment)
+
+
+def format_harp(sample: Dict[str, Any]) -> PromptAnswerSample:
+    problem = _normalize_text(sample.get("problem"))
+    answer = _normalize_text(sample.get("answer"))
+    prompt = f"Problem:\n{problem}".strip()
+    return {
+        "prompt": prompt,
+        "answer": answer,
+        "task_type": "harp",
+    }
 
 
 def _estimate_word_length(prompt_answer: PromptAnswerSample) -> int:
@@ -559,7 +822,7 @@ def load_default_4_4_2_blended_dataset(
     )
 
 
-def load_stage1_kd_blended_dataset(
+def load_stage1_blended_dataset(
     *,
     split: str = "train",
     seed: int = 42,
@@ -568,7 +831,7 @@ def load_stage1_kd_blended_dataset(
     max_profiler_tokens: int = 6080,
     max_composer_tokens: int = 6080,
 ) -> BlendResult:
-    """Loads the 30k Stage 1 KD blend with LongMagpie-heavy sampling."""
+    """Loads the 30k Stage 1 blend with LongMagpie-heavy sampling."""
     return load_blended_dataset(
         split=split,
         seed=seed,
@@ -589,15 +852,43 @@ def load_stage23_blended_dataset(
     max_profiler_tokens: int = 6080,
     max_composer_tokens: int = 6080,
 ) -> BlendResult:
-    """Loads the 200k Stage 2/3 blend with 40/40/20 sampling."""
-    return load_blended_dataset(
-        split=split,
+    """Loads the Stage 2/3 blend with MoreHopQA/HARP/NQ-short 50/35/15 sampling."""
+    del max_profiler_tokens, max_composer_tokens
+    if load_dataset is None:
+        raise ModuleNotFoundError("The 'datasets' package is required to load blended datasets.")
+
+    _dataset_log(
+        "Loading Stage 23 datasets "
+        f"(split={split}, ratios=[50, 35, 15])"
+    )
+    morehopqa_hf = load_dataset("alabnii/morehopqa", split="test")
+    harp_hf = _load_harp_dataset()
+    nq_short_hf = load_dataset("ghmfx/natural-questions-short", split=split)
+
+    if hasattr(nq_short_hf, "filter"):
+        nq_short_hf = nq_short_hf.filter(
+            lambda sample: bool(sample.get("has_correct_context", True)) and bool(_extract_nq_short_answer_text(sample)),
+            desc="Filtering Natural Questions short-answer rows with valid contexts",
+        )
+
+    _dataset_log(
+        "Stage 23 sources loaded: "
+        f"morehopqa={len(morehopqa_hf)}, "
+        f"harp={len(harp_hf)}, "
+        f"nq_short={len(nq_short_hf)}"
+    )
+
+    morehopqa_ds = HFDatasetAdapter(morehopqa_hf, format_morehopqa, "morehopqa")
+    harp_ds = HFDatasetAdapter(harp_hf, format_harp, "harp")
+    nq_short_ds = HFDatasetAdapter(nq_short_hf, format_nq_short, "nq_short")
+
+    return build_ratio_concat_dataset(
+        datasets=[morehopqa_ds, harp_ds, nq_short_ds],
+        ratios=[50, 35, 15],
         seed=seed,
         epoch_size=epoch_size,
         with_replacement=with_replacement,
-        ratios=[4, 4, 2],
-        max_profiler_tokens=max_profiler_tokens,
-        max_composer_tokens=max_composer_tokens,
+        source_names=["morehopqa", "harp", "nq_short"],
     )
 
 
@@ -667,6 +958,17 @@ def _load_long_magpie_dataset(split: str = "train") -> HFDataset:
     snapshot_dir = snapshot_download(repo_id=repo_id, repo_type="dataset")
     _dataset_log(f"LongMagpie snapshot ready: {snapshot_dir}")
     return load_dataset(snapshot_dir, split=split)
+
+
+def _load_harp_dataset() -> HFDataset:
+    if load_dataset is None:
+        raise ModuleNotFoundError("The 'datasets' package is required to load HARP.")
+
+    return load_dataset(
+        "json",
+        data_files={"train": HARP_DATA_URL},
+        split="train",
+    )
 
 
 def save_dataset_as_jsonl(
