@@ -28,6 +28,10 @@ except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
 PromptAnswerSample = Dict[str, Any]
 LONG_MAGPIE_FILTER_CACHE_VERSION = 1
 HARP_DATA_URL = "https://github.com/aadityasingh/HARP/raw/main/HARP.jsonl.zip"
+MOREHOPQA_HUMAN_VERIFIED_JSON_URL = (
+    "https://huggingface.co/datasets/alabnii/morehopqa/resolve/main/"
+    "data/with_human_verification.json"
+)
 
 
 def _is_primary_dataset_process() -> bool:
@@ -759,7 +763,7 @@ def load_stage23_blended_dataset(
         "Loading Stage 23 datasets "
         f"(split={split}, ratios=[50, 35, 15])"
     )
-    morehopqa_hf = load_dataset("alabnii/morehopqa", split="test")
+    morehopqa_hf = _load_morehopqa_dataset(split="test")
     harp_hf = _load_harp_dataset()
     nq_short_hf = load_dataset("ghmfx/natural-questions-short", split=split)
 
@@ -862,6 +866,34 @@ def _load_long_magpie_dataset(split: str = "train") -> HFDataset:
     snapshot_dir = snapshot_download(repo_id=repo_id, repo_type="dataset")
     _dataset_log(f"LongMagpie snapshot ready: {snapshot_dir}")
     return load_dataset(snapshot_dir, split=split)
+
+
+def _load_morehopqa_dataset(split: str = "test") -> HFDataset:
+    if load_dataset is None:
+        raise ModuleNotFoundError("The 'datasets' package is required to load MoreHopQA.")
+
+    if snapshot_download is not None:
+        try:
+            snapshot_dir = snapshot_download(
+                repo_id="alabnii/morehopqa",
+                repo_type="dataset",
+                allow_patterns=[
+                    "data/with_human_verification.json",
+                    "verified/*.parquet",
+                ],
+            )
+            snapshot_path = Path(snapshot_dir)
+            json_path = snapshot_path / "data" / "with_human_verification.json"
+            if json_path.exists():
+                return load_dataset("json", data_files={split: str(json_path)}, split=split)
+
+            parquet_files = sorted((snapshot_path / "verified").glob("*.parquet"))
+            if parquet_files:
+                return load_dataset("parquet", data_files={split: [str(path) for path in parquet_files]}, split=split)
+        except Exception as exc:
+            _dataset_log(f"MoreHopQA snapshot load failed, falling back to direct JSON URL: {exc}")
+
+    return load_dataset("json", data_files={split: MOREHOPQA_HUMAN_VERIFIED_JSON_URL}, split=split)
 
 
 def _load_harp_dataset() -> HFDataset:
