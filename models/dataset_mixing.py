@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import random
-import re
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -371,111 +370,6 @@ def format_nq_short(sample: Dict[str, Any]) -> PromptAnswerSample:
     }
 
 
-def _find_matching_brace(text: str, start_index: int) -> Optional[int]:
-    depth = 0
-    index = start_index
-    while index < len(text):
-        character = text[index]
-        if character == "{" and (index == 0 or text[index - 1] != "\\"):
-            depth += 1
-        elif character == "}" and (index == 0 or text[index - 1] != "\\"):
-            depth -= 1
-            if depth == 0:
-                return index
-        index += 1
-    return None
-
-
-def extract_latex_math_spans(text: str) -> List[Tuple[int, int]]:
-    spans: List[Tuple[int, int]] = []
-
-    for pattern in (r"\\\((.*?)\\\)", r"\\\[(.*?)\\\]"):
-        for match in re.finditer(pattern, text, flags=re.DOTALL):
-            spans.append((match.start(), match.end()))
-
-    for match in re.finditer(r"\\begin\{align\*\}(.*?)\\end\{align\*\}", text, flags=re.DOTALL):
-        spans.append((match.start(), match.end()))
-
-    index = 0
-    while index < len(text):
-        if text[index] != "$" or (index > 0 and text[index - 1] == "\\"):
-            index += 1
-            continue
-        if index + 1 < len(text) and text[index + 1] == "$":
-            index += 2
-            continue
-
-        end_index = index + 1
-        while end_index < len(text):
-            if text[end_index] == "$" and text[end_index - 1] != "\\":
-                break
-            end_index += 1
-        if end_index < len(text):
-            spans.append((index, end_index + 1))
-            index = end_index + 1
-            continue
-        index += 1
-
-    boxed_pattern = re.compile(r"\\boxed\s*\{")
-    for match in boxed_pattern.finditer(text):
-        brace_start = match.end() - 1
-        brace_end = _find_matching_brace(text, brace_start)
-        if brace_end is not None:
-            spans.append((match.start(), brace_end + 1))
-
-    deduplicated_spans = sorted(set(spans))
-    return deduplicated_spans
-
-
-def _merge_overlapping_spans(spans: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    merged: List[Tuple[int, int]] = []
-    for start, end in sorted(spans):
-        if not merged or start > merged[-1][1]:
-            merged.append((start, end))
-            continue
-        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-    return merged
-
-
-def _strip_latex_target_wrappers(text: str) -> str:
-    stripped = text.strip()
-    changed = True
-    while changed and stripped:
-        changed = False
-        for prefix, suffix in (
-            ("\\(", "\\)"),
-            ("\\[", "\\]"),
-            ("\\begin{align*}", "\\end{align*}"),
-            ("$", "$"),
-        ):
-            if stripped.startswith(prefix) and stripped.endswith(suffix) and len(stripped) > len(prefix) + len(suffix):
-                stripped = stripped[len(prefix):len(stripped) - len(suffix)].strip()
-                changed = True
-                break
-        if changed:
-            continue
-
-        boxed_match = re.match(r"\\boxed\s*\{", stripped)
-        if boxed_match is None:
-            continue
-        brace_start = boxed_match.end() - 1
-        brace_end = _find_matching_brace(stripped, brace_start)
-        if brace_end == len(stripped) - 1:
-            stripped = stripped[brace_start + 1:brace_end].strip()
-            changed = True
-
-    return stripped
-
-
-def extract_latex_math_text(text: str) -> str:
-    spans = _merge_overlapping_spans(extract_latex_math_spans(text))
-    segments = [
-        _strip_latex_target_wrappers(text[start:end])
-        for start, end in spans
-    ]
-    return "\n".join(segment for segment in segments if segment)
-
-
 def format_harp(sample: Dict[str, Any]) -> PromptAnswerSample:
     problem = _normalize_text(sample.get("problem"))
     answer = _normalize_text(sample.get("answer"))
@@ -485,6 +379,10 @@ def format_harp(sample: Dict[str, Any]) -> PromptAnswerSample:
         "answer": answer,
         "task_type": "harp",
     }
+
+
+def _keep_harp_sample(sample: Dict[str, Any]) -> bool:
+    return sample.get("multiple_choice_only") is False
 
 
 def _estimate_word_length(prompt_answer: PromptAnswerSample) -> int:
@@ -528,8 +426,8 @@ def is_prompt_answer_within_token_limits(
     *,
     profiler_tokenizer,
     composer_tokenizer,
-    max_profiler_tokens: int = 6080,
-    max_composer_tokens: int = 6080,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
 ) -> bool:
     prompt = str(prompt_answer.get("prompt", "")).strip()
     answer = str(prompt_answer.get("answer", "")).strip()
@@ -560,8 +458,8 @@ def _normalize_batch_slice(batch: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
 def is_within_long_context_limit(
     sample: Dict[str, Any],
     *,
-    max_profiler_tokens: int = 6080,
-    max_composer_tokens: int = 6080,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
     profiler_tokenizer_name: str = "answerdotai/ModernBERT-base",
     composer_tokenizer_name: str = "Qwen/Qwen3-1.7B",
 ) -> bool:
@@ -583,8 +481,8 @@ def is_within_long_context_limit(
 def build_long_magpie_subset_with_length_limit(
     dataset: HFDataset,
     *,
-    max_profiler_tokens: int = 6080,
-    max_composer_tokens: int = 6080,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
     profiler_tokenizer_name: str = "answerdotai/ModernBERT-base",
     composer_tokenizer_name: str = "Qwen/Qwen3-1.7B",
     batch_size: int = 256,
@@ -807,8 +705,8 @@ def load_default_4_4_2_blended_dataset(
     seed: int = 42,
     epoch_size: Optional[int] = None,
     with_replacement: bool = False,
-    max_profiler_tokens: int = 6080,
-    max_composer_tokens: int = 6080,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
 ) -> BlendResult:
     """Loads and blends Open-Platypus, LongMagpie, and no_robots by 4:4:2."""
     return load_blended_dataset(
@@ -828,8 +726,8 @@ def load_stage1_blended_dataset(
     seed: int = 42,
     epoch_size: int = 30_000,
     with_replacement: bool = False,
-    max_profiler_tokens: int = 6080,
-    max_composer_tokens: int = 6080,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
 ) -> BlendResult:
     """Loads the 30k Stage 1 blend with LongMagpie-heavy sampling."""
     return load_blended_dataset(
@@ -849,8 +747,8 @@ def load_stage23_blended_dataset(
     seed: int = 42,
     epoch_size: int = 200_000,
     with_replacement: bool = True,
-    max_profiler_tokens: int = 6080,
-    max_composer_tokens: int = 6080,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
 ) -> BlendResult:
     """Loads the Stage 2/3 blend with MoreHopQA/HARP/NQ-short 50/35/15 sampling."""
     del max_profiler_tokens, max_composer_tokens
@@ -864,6 +762,12 @@ def load_stage23_blended_dataset(
     morehopqa_hf = load_dataset("alabnii/morehopqa", split="test")
     harp_hf = _load_harp_dataset()
     nq_short_hf = load_dataset("ghmfx/natural-questions-short", split=split)
+
+    if hasattr(harp_hf, "filter"):
+        harp_hf = harp_hf.filter(
+            _keep_harp_sample,
+            desc="Filtering HARP rows with multiple_choice_only == false",
+        )
 
     if hasattr(nq_short_hf, "filter"):
         nq_short_hf = nq_short_hf.filter(
@@ -899,8 +803,8 @@ def load_blended_dataset(
     epoch_size: Optional[int] = None,
     with_replacement: bool = False,
     ratios: Sequence[int] = (4, 4, 2),
-    max_profiler_tokens: int = 6080,
-    max_composer_tokens: int = 6080,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
 ) -> BlendResult:
     """Loads and blends Open-Platypus, LongMagpie, and no_robots with custom ratios."""
     if load_dataset is None:

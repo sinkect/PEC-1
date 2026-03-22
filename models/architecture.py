@@ -29,6 +29,7 @@ class PECEngine(nn.Module):
             profiler_path="answerdotai/ModernBERT-base",
             composer_path="Qwen/Qwen3-1.7B",
             num_query_tokens=64,
+            morehop_align_lambda: float = 0.1,
             freeze_profiler=False,
             freeze_composer=True,
             freeze_extruder=False,
@@ -68,6 +69,7 @@ class PECEngine(nn.Module):
         ).to(dtype=torch.bfloat16) # [D_prof] -> [D_comp]
 
         self.soft_prompt_scale = nn.Parameter(torch.tensor(0.03))
+        self.morehop_align_lambda = float(morehop_align_lambda)
 
         self.post_extruder_norm = nn.RMSNorm(self.prof_dim, eps=1e-6)
         self.sep_token = nn.Parameter(torch.randn(1, 1, self.comp_dim))  # [1, 1, D_comp]
@@ -275,7 +277,7 @@ class PECEngine(nn.Module):
 
         total_loss = answer_loss
         if mh_align_loss is not None:
-            total_loss = mh_align_loss * 0.1 if total_loss is None else total_loss + (0.1 * mh_align_loss)
+            total_loss = total_loss + (self.morehop_align_lambda * mh_align_loss)
 
         return {
             "loss": total_loss,

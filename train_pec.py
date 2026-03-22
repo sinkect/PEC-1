@@ -118,6 +118,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-l1-max-lambda", type=float, default=2e-4)
     parser.add_argument("--gate-l1-warmup-ratio", type=float, default=0.3)
     parser.add_argument("--projector-raw-l2-lambda", type=float, default=1e-5)
+    parser.add_argument(
+        "--morehop-align-lambda",
+        type=float,
+        default=0.1,
+        help="Lambda for the MoreHopQA z_pool alignment auxiliary loss.",
+    )
     parser.add_argument("--max-profiler-len", type=int, default=6080)
     parser.add_argument("--max-composer-len", type=int, default=6080)
     return parser.parse_args()
@@ -547,6 +553,7 @@ def main() -> None:
         profiler_path=str(args.profiler_model_path),
         composer_path=args.composer_model_name,
         num_query_tokens=args.num_query_tokens,
+        morehop_align_lambda=args.morehop_align_lambda,
         freeze_profiler=args.freeze_profiler,
         freeze_extruder=args.freeze_extruder,
     )
