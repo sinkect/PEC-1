@@ -201,6 +201,7 @@ class Extruder(nn.Module):
         Input: context [B, S, D]
         Output: latents [B, Nq, D]
         """
+        context = context.to(dtype=self.query_tokens.dtype)
         latents = self.build_query_tokens(context, attn_mask=attn_mask)  # [B, Nq, D]
 
         if attn_mask is not None:
