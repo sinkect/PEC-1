@@ -14,11 +14,9 @@ from torch.utils.data import ConcatDataset, Dataset, Subset
 
 try:
     from datasets import Dataset as HFDataset
-    from datasets import concatenate_datasets
     from datasets import load_dataset
 except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
     HFDataset = Any
-    concatenate_datasets = None
     load_dataset = None
 
 try:
@@ -210,6 +208,19 @@ class HFDatasetAdapter(Dataset):
         normalized_sample["answer"] = str(prompt_answer.get("answer", "")).strip()
         normalized_sample["source"] = self._source_name
         return normalized_sample
+
+
+class RowListDataset(Dataset):
+    """Simple row-backed dataset used when Arrow reconstruction is unnecessary."""
+
+    def __init__(self, rows: Sequence[Dict[str, Any]]) -> None:
+        self._rows = list(rows)
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        return self._rows[index]
 
 
 def format_open_platypus(sample: Dict[str, Any]) -> PromptAnswerSample:
@@ -893,11 +904,11 @@ def _load_long_magpie_dataset(split: str = "train") -> HFDataset:
     return load_dataset(snapshot_dir, split=split)
 
 
-def _load_morehopqa_dataset(split: str = "train", include_unverified: bool = True) -> HFDataset:
+def _load_morehopqa_dataset(split: str = "train", include_unverified: bool = True) -> Dataset:
     if load_dataset is None:
         raise ModuleNotFoundError("The 'datasets' package is required to load MoreHopQA.")
 
-    def load_morehopqa_json_source(data_file: str) -> HFDataset:
+    def load_morehopqa_json_source(data_file: str) -> Dataset:
         dataset = load_dataset("json", data_files={split: data_file}, split=split)
         normalized_rows = []
         for index in range(len(dataset)):
@@ -911,16 +922,18 @@ def _load_morehopqa_dataset(split: str = "train", include_unverified: bool = Tru
                     "paragraphs": sample.get("paragraphs"),
                 }
             )
-        return HFDataset.from_list(normalized_rows)
+        return RowListDataset(normalized_rows)
 
-    def combine_morehopqa_datasets(datasets: List[HFDataset]) -> HFDataset:
+    def combine_morehopqa_datasets(datasets: List[Dataset]) -> Dataset:
         if not datasets:
             raise ValueError("No MoreHopQA datasets were loaded.")
         if len(datasets) == 1:
             return datasets[0]
-        if concatenate_datasets is None:
-            raise ModuleNotFoundError("The 'datasets' package is required to concatenate MoreHopQA datasets.")
-        return concatenate_datasets(datasets)
+        combined_rows: List[Dict[str, Any]] = []
+        for dataset in datasets:
+            for index in range(len(dataset)):
+                combined_rows.append(dataset[index])
+        return RowListDataset(combined_rows)
 
     if snapshot_download is not None:
         try:
@@ -936,7 +949,7 @@ def _load_morehopqa_dataset(split: str = "train", include_unverified: bool = Tru
             snapshot_path = Path(snapshot_dir)
             verified_json_path = snapshot_path / "data" / "with_human_verification.json"
             unverified_json_path = snapshot_path / "data" / "without_human_verification.json"
-            datasets: List[HFDataset] = []
+            datasets: List[Dataset] = []
             if verified_json_path.exists():
                 datasets.append(load_morehopqa_json_source(str(verified_json_path)))
             if include_unverified and unverified_json_path.exists():
