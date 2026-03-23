@@ -32,6 +32,10 @@ MOREHOPQA_HUMAN_VERIFIED_JSON_URL = (
     "https://huggingface.co/datasets/alabnii/morehopqa/resolve/main/"
     "data/with_human_verification.json"
 )
+MOREHOPQA_UNVERIFIED_JSON_URL = (
+    "https://huggingface.co/datasets/alabnii/morehopqa/resolve/main/"
+    "data/without_human_verification.json"
+)
 
 
 def _is_primary_dataset_process() -> bool:
@@ -742,7 +746,7 @@ def load_stage1_blended_dataset(
         "Loading Stage 1 datasets "
         f"(split={split}, ratios=[50, 35, 15])"
     )
-    morehopqa_hf = _load_morehopqa_dataset(split="test")
+    morehopqa_hf = _load_morehopqa_dataset(split=split, include_unverified=True)
     harp_hf = _load_harp_dataset()
     nq_short_hf = load_dataset("ghmfx/natural-questions-short", split=split)
 
@@ -887,7 +891,7 @@ def _load_long_magpie_dataset(split: str = "train") -> HFDataset:
     return load_dataset(snapshot_dir, split=split)
 
 
-def _load_morehopqa_dataset(split: str = "test") -> HFDataset:
+def _load_morehopqa_dataset(split: str = "train", include_unverified: bool = True) -> HFDataset:
     if load_dataset is None:
         raise ModuleNotFoundError("The 'datasets' package is required to load MoreHopQA.")
 
@@ -898,21 +902,31 @@ def _load_morehopqa_dataset(split: str = "test") -> HFDataset:
                 repo_type="dataset",
                 allow_patterns=[
                     "data/with_human_verification.json",
+                    "data/without_human_verification.json",
                     "verified/*.parquet",
                 ],
             )
             snapshot_path = Path(snapshot_dir)
-            json_path = snapshot_path / "data" / "with_human_verification.json"
-            if json_path.exists():
-                return load_dataset("json", data_files={split: str(json_path)}, split=split)
+            verified_json_path = snapshot_path / "data" / "with_human_verification.json"
+            unverified_json_path = snapshot_path / "data" / "without_human_verification.json"
+            json_paths: List[str] = []
+            if verified_json_path.exists():
+                json_paths.append(str(verified_json_path))
+            if include_unverified and unverified_json_path.exists():
+                json_paths.append(str(unverified_json_path))
+            if json_paths and (not include_unverified or unverified_json_path.exists()):
+                return load_dataset("json", data_files={split: json_paths}, split=split)
 
             parquet_files = sorted((snapshot_path / "verified").glob("*.parquet"))
-            if parquet_files:
+            if parquet_files and not include_unverified:
                 return load_dataset("parquet", data_files={split: [str(path) for path in parquet_files]}, split=split)
         except Exception as exc:
             _dataset_log(f"MoreHopQA snapshot load failed, falling back to direct JSON URL: {exc}")
 
-    return load_dataset("json", data_files={split: MOREHOPQA_HUMAN_VERIFIED_JSON_URL}, split=split)
+    json_urls = [MOREHOPQA_HUMAN_VERIFIED_JSON_URL]
+    if include_unverified:
+        json_urls.append(MOREHOPQA_UNVERIFIED_JSON_URL)
+    return load_dataset("json", data_files={split: json_urls}, split=split)
 
 
 def _load_harp_dataset() -> HFDataset:
