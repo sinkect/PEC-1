@@ -403,87 +403,28 @@ def generate_pec_responses(
             f"{prefix}_std": float(tensor_float.std(unbiased=False).item()),
         }
 
-    def summarize_soft_prompt_artifacts(
+    def summarize_memory_artifacts(
         extruder_latents: torch.Tensor,
-        projector_raw: torch.Tensor,
-        soft_prompts: torch.Tensor,
+        memory_keys: torch.Tensor,
+        memory_values: torch.Tensor,
     ) -> List[Dict[str, Any]]:
-        p_slice = soft_prompts[:, :5, :8].detach().float().cpu().tolist()
+        k_slice = memory_keys[:, 0, :5, :8].detach().float().cpu().tolist()
+        v_slice = memory_values[:, 0, :5, :8].detach().float().cpu().tolist()
         return [
             {
                 **summarize_tensor(z_sample, prefix="latent_z"),
-                **summarize_tensor(p_sample, prefix="soft_prompt_p"),
-                "projector_raw_std": float(projector_raw_sample.detach().float().std(unbiased=False).item()),
-                "final_p_std": float(p_sample.detach().float().std(unbiased=False).item()),
-                "soft_prompt_p_slice": p_head,
+                **summarize_tensor(k_sample, prefix="memory_k"),
+                **summarize_tensor(v_sample, prefix="memory_v"),
+                "memory_slots": int(z_sample.shape[0]),
+                "memory_key_slice": k_head,
+                "memory_value_slice": v_head,
             }
-            for z_sample, projector_raw_sample, p_sample, p_head in zip(
+            for z_sample, k_sample, v_sample, k_head, v_head in zip(
                 extruder_latents,
-                projector_raw,
-                soft_prompts,
-                p_slice,
-            )
-        ]
-
-    def summarize_gated_attention(
-        gate_scores: torch.Tensor,
-        gate_logits: torch.Tensor | None,
-    ) -> List[Dict[str, Any]]:
-        if gate_scores.ndim != 4:
-            raise ValueError(f"Expected gate_scores to have shape [B, L, N_q, D], got {tuple(gate_scores.shape)}")
-        if gate_logits is not None and gate_logits.shape != gate_scores.shape:
-            raise ValueError(
-                "gate_logits must match gate_scores shape; "
-                f"got {tuple(gate_logits.shape)} vs {tuple(gate_scores.shape)}"
-            )
-
-        if gate_scores.shape[1] == 0:
-            zero = gate_scores.new_zeros((gate_scores.shape[0],))
-            return [
-                {
-                    "gate_mean": 0.0,
-                    "gate_max": 0.0,
-                    "gate_abs_mean": 0.0,
-                    "gate_abs_max": 0.0,
-                    "gate_logit_mean": 0.0,
-                    "gate_logit_abs_max": 0.0,
-                    "gate_layer_query_mean": [],
-                    "gate_logit_layer_query_mean": [],
-                }
-                for _ in zero
-            ]
-
-        gate_mean = gate_scores.mean(dim=(1, 2, 3))
-        gate_max = gate_scores.amax(dim=(1, 2, 3))
-        gate_layer_query_mean = gate_scores.mean(dim=-1)
-
-        if gate_logits is None:
-            gate_logit_mean = gate_scores.new_zeros((gate_scores.shape[0],))
-            gate_logit_abs_max = gate_scores.new_zeros((gate_scores.shape[0],))
-            gate_logit_layer_query_mean = gate_scores.new_zeros(gate_scores.shape[:3])
-        else:
-            gate_logit_mean = gate_logits.mean(dim=(1, 2, 3))
-            gate_logit_abs_max = gate_logits.abs().amax(dim=(1, 2, 3))
-            gate_logit_layer_query_mean = gate_logits.mean(dim=-1)
-
-        return [
-            {
-                "gate_mean": float(mean.item()),
-                "gate_max": float(maximum.item()),
-                "gate_abs_mean": float(mean.item()),
-                "gate_abs_max": float(maximum.item()),
-                "gate_logit_mean": float(logit_mean.item()),
-                "gate_logit_abs_max": float(logit_abs_max.item()),
-                "gate_layer_query_mean": layer_query_mean.detach().cpu().tolist(),
-                "gate_logit_layer_query_mean": logit_layer_query_mean.detach().cpu().tolist(),
-            }
-            for mean, maximum, logit_mean, logit_abs_max, layer_query_mean, logit_layer_query_mean in zip(
-                gate_mean,
-                gate_max,
-                gate_logit_mean,
-                gate_logit_abs_max,
-                gate_layer_query_mean,
-                gate_logit_layer_query_mean,
+                memory_keys,
+                memory_values,
+                k_slice,
+                v_slice,
             )
         ]
 
@@ -513,74 +454,62 @@ def generate_pec_responses(
     )
     composer_inputs = move_tokenized_batch(composer_inputs, device)
 
-    artifacts = model.build_soft_prompt_artifacts(
+    artifacts = model.build_memory_artifacts(
         profiler_input_ids=profiler_inputs["input_ids"],
         profiler_attention_mask=profiler_inputs["attention_mask"],
-        return_gate_scores=True,
-        return_gate_logits=True,
     )
-    soft_prompts = artifacts["soft_prompts"]
     extruder_latents = artifacts["extruder_latents"]
-    projector_raw = artifacts["projector_raw"]
-    gate_scores = artifacts["gate_scores"]
-    gate_logits = artifacts["gate_logits"]
+    memory_keys = artifacts["memory_keys"]
+    memory_values = artifacts["memory_values"]
+    memory_stats = summarize_memory_artifacts(extruder_latents, memory_keys, memory_values)
 
-    text_embeds = model.composer.get_input_embeddings()(composer_inputs["input_ids"])
-    final_inputs_embeds = torch.cat([soft_prompts, text_embeds], dim=1)
-
-    soft_prompt_mask = torch.ones(
-        (soft_prompts.shape[0], soft_prompts.shape[1]),
-        device=device,
-        dtype=composer_inputs["attention_mask"].dtype,
-    )
-    final_attention_mask = torch.cat([soft_prompt_mask, composer_inputs["attention_mask"]], dim=1)
-
-    outputs = model.composer(
-        inputs_embeds=final_inputs_embeds,
-        attention_mask=final_attention_mask,
-        use_cache=True,
-        return_dict=True,
-    )
-    next_token_logits = outputs.logits[:, -1, :]
-    past_key_values = outputs.past_key_values
-    generated_tokens: List[torch.Tensor] = []
-    current_attention_mask = final_attention_mask
-    finished = torch.zeros(composer_inputs["input_ids"].shape[0], dtype=torch.bool, device=device)
-    eos_token_id = composer_tokenizer.eos_token_id
-
-    for _ in range(max_new_tokens):
-        next_token = select_next_token(
-            next_token_logits,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-        )
-        if eos_token_id is not None:
-            next_token = torch.where(finished, torch.full_like(next_token, eos_token_id), next_token)
-        generated_tokens.append(next_token.unsqueeze(1))
-
-        if eos_token_id is not None:
-            finished = finished | (next_token == eos_token_id)
-            if torch.all(finished):
-                break
-
-        current_attention_mask = torch.cat(
-            [
-                current_attention_mask,
-                torch.ones((current_attention_mask.shape[0], 1), device=device, dtype=current_attention_mask.dtype),
-            ],
-            dim=1,
-        )
-
+    with model.composer_memory_context(memory_keys=memory_keys, memory_values=memory_values):
         outputs = model.composer(
-            input_ids=next_token.unsqueeze(1),
-            attention_mask=current_attention_mask,
-            past_key_values=past_key_values,
+            input_ids=composer_inputs["input_ids"],
+            attention_mask=composer_inputs["attention_mask"],
             use_cache=True,
             return_dict=True,
         )
         next_token_logits = outputs.logits[:, -1, :]
         past_key_values = outputs.past_key_values
+        generated_tokens: List[torch.Tensor] = []
+        current_attention_mask = composer_inputs["attention_mask"]
+        finished = torch.zeros(composer_inputs["input_ids"].shape[0], dtype=torch.bool, device=device)
+        eos_token_id = composer_tokenizer.eos_token_id
+
+        for _ in range(max_new_tokens):
+            next_token = select_next_token(
+                next_token_logits,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            if eos_token_id is not None:
+                next_token = torch.where(finished, torch.full_like(next_token, eos_token_id), next_token)
+            generated_tokens.append(next_token.unsqueeze(1))
+
+            if eos_token_id is not None:
+                finished = finished | (next_token == eos_token_id)
+                if torch.all(finished):
+                    break
+
+            current_attention_mask = torch.cat(
+                [
+                    current_attention_mask,
+                    torch.ones((current_attention_mask.shape[0], 1), device=device, dtype=current_attention_mask.dtype),
+                ],
+                dim=1,
+            )
+
+            outputs = model.composer(
+                input_ids=next_token.unsqueeze(1),
+                attention_mask=current_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            next_token_logits = outputs.logits[:, -1, :]
+            past_key_values = outputs.past_key_values
 
     if generated_tokens:
         generated_ids = torch.cat(generated_tokens, dim=1)
@@ -588,16 +517,7 @@ def generate_pec_responses(
     else:
         generated_texts = ["" for _ in clean_prompt_texts]
 
-    gate_stats = summarize_gated_attention(gate_scores, gate_logits)
-    soft_prompt_stats = summarize_soft_prompt_artifacts(extruder_latents, projector_raw, soft_prompts)
-    gate_stats = [
-        {
-            **per_gate_stats,
-            **per_soft_prompt_stats,
-        }
-        for per_gate_stats, per_soft_prompt_stats in zip(gate_stats, soft_prompt_stats)
-    ]
-    return generated_texts, gate_stats
+    return generated_texts, memory_stats
 
 
 def load_base_model(model_name: str, device: torch.device, dtype: torch.dtype):
@@ -637,9 +557,10 @@ def load_pec_model(
     filtered_unexpected_keys = [
         key for key in unexpected_keys
         if not (
-            key.startswith("prev_sent_head.")
-            or key.startswith("prev_span_head.")
-            or key.startswith("expr_head.")
+            key.startswith("projector.")
+            or key == "soft_prompt_scale"
+            or key == "sep_token"
+            or ".gate_proj." in key
         )
     ]
     if filtered_unexpected_keys:
@@ -648,7 +569,7 @@ def load_pec_model(
     dynamic_query_prefixes = ("extruder.delta_mlp", "extruder.gate_mlp")
     critical_missing = [
         key for key in missing_keys
-        if key.startswith(("extruder", "projector", "post_extruder_norm"))
+        if key.startswith(("extruder", "post_extruder_norm"))
         and not key.startswith(dynamic_query_prefixes)
     ]
     if critical_missing:

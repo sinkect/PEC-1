@@ -14,16 +14,11 @@ _EXPORT_MODULES = {
     "load_blended_dataset": ".dataset_mixing",
     "load_default_4_4_2_blended_dataset": ".dataset_mixing",
     "load_stage1_blended_dataset": ".dataset_mixing",
+    "load_stage2_blended_dataset": ".dataset_mixing",
     "load_stage23_blended_dataset": ".dataset_mixing",
     "save_blend_metadata": ".dataset_mixing",
     "save_dataset_as_jsonl": ".dataset_mixing",
     "save_sampled_by_source_as_jsonl": ".dataset_mixing",
-    "GateL1Trainer": ".losses",
-    "GateL1WarmupConfig": ".losses",
-    "ProjectorRawL2Config": ".losses",
-    "compute_projector_raw_l2_loss": ".losses",
-    "compute_total_loss_with_gate_l1": ".losses",
-    "trainer_compute_loss_with_gate_l1": ".losses",
 }
 
 

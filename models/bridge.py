@@ -1,9 +1,11 @@
-from typing import Optional, Tuple, Union
-from einops import rearrange
-import torch.nn as nn
+from typing import Optional
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 from torch.utils.checkpoint import checkpoint
+
 
 class GroupQueryAttention(nn.Module):
     """
@@ -12,7 +14,7 @@ class GroupQueryAttention(nn.Module):
     - Key/Value: Input Context
     """
 
-    def __init__(self, hidden_dim, head_dim, num_heads, num_key_value_heads):
+    def __init__(self, hidden_dim: int, head_dim: int, num_heads: int, num_key_value_heads: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -26,36 +28,39 @@ class GroupQueryAttention(nn.Module):
         self.q_proj = nn.Linear(hidden_dim, self.q_dim, bias=False)
         self.kv_proj = nn.Linear(hidden_dim, self.kv_dim * 2, bias=False)
 
-    def forward(self, latents, context, attn_mask=None):
+    def forward(
+        self,
+        latents: torch.Tensor,
+        context: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Project latent slots into grouped query heads.  # [B, Nq, D] -> [B, Nq, Hq, Dh]
+        query = self.q_proj(latents)
+        query = rearrange(query, "B Nq (H Dh) -> B Nq H Dh", H=self.num_heads)
 
-        # 1. Projections
-        query = self.q_proj(latents) # [B, S, H*D]
-        query = rearrange(query, 'B S (H D) -> B S H D', H=self.num_heads)
-
+        # Project context into grouped keys and values.  # [B, S, D] -> [B, S, 2, Hkv, Dh]
         kv = self.kv_proj(context)
-        kv = rearrange(kv, 'B S (TWO H D) -> B S TWO H D', TWO=2, H=self.num_key_value_heads)
-        key, value = kv.unbind(dim=2) # [B, S, H, D]
+        kv = rearrange(kv, "B S (Two H Dh) -> B S Two H Dh", Two=2, H=self.num_key_value_heads)
+        key, value = kv.unbind(dim=2)  # each: [B, S, Hkv, Dh]
 
-        # 2. Transpose for SDPA [B, H, S, D]
-        query, key, value = map(lambda t: rearrange(t, 'B S H D-> B H S D'), (query, key, value))
+        # SDPA expects heads before sequence.  # [B, Nq, Hq, Dh] -> [B, Hq, Nq, Dh]
+        query, key, value = map(lambda tensor: rearrange(tensor, "B S H Dh -> B H S Dh"), (query, key, value))
 
-        # 4. Attention
         attn_output = F.scaled_dot_product_attention(
-            query, key, value,
+            query,
+            key,
+            value,
             attn_mask=attn_mask,
             is_causal=False,
-            enable_gqa=True
+            enable_gqa=True,
         )
 
-        # 5. Output Projection
-        # [B, H, S, D] -> [B, S, (H D)]
-        attn_output = rearrange(attn_output, 'B H S D -> B S (H D)')
-
-        return attn_output
+        # Merge grouped heads back into the latent hidden dimension.  # [B, Hq, Nq, Dh] -> [B, Nq, D]
+        return rearrange(attn_output, "B H Nq Dh -> B Nq (H Dh)")
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, hidden_dim, num_heads, num_key_value_heads):
+    def __init__(self, hidden_dim: int, num_heads: int, num_key_value_heads: int):
         super().__init__()
         self.norm_q = nn.RMSNorm(hidden_dim, eps=1e-6)
         self.norm_k = nn.RMSNorm(hidden_dim, eps=1e-6)
@@ -64,10 +69,9 @@ class AttentionBlock(nn.Module):
             hidden_dim,
             hidden_dim // num_heads,
             num_heads,
-            num_key_value_heads
+            num_key_value_heads,
         )
 
-        self.gate_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
 
     def forward(
@@ -75,37 +79,27 @@ class AttentionBlock(nn.Module):
         latents: torch.Tensor,
         context: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-        return_gate: bool = False,
-        return_gate_logits: bool = False,
-    ) -> Union[
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ]:
-        # Cross-Attention Block
+    ) -> torch.Tensor:
+        # Normalize latent slots and context independently before cross-attention.  # [B, Nq, D], [B, S, D]
+        latents_norm = self.norm_q(latents)  # [B, Nq, D]
+        context_norm = self.norm_k(context)  # [B, S, D]
 
-        latents_norm = self.norm_q(latents)  # [B, N_q, D]
-        context_norm = self.norm_k(context)  # [B, S_ctx, D]
-
-        attn_out = self.attn(latents_norm, context_norm, attn_mask=attn_mask)  # [B, N_q, D]
-        gate_logits = self.gate_proj(latents_norm)  # [B, N_q, D]
-        gate_scores = torch.sigmoid(gate_logits)  # [B, N_q, D]
-        gated_out = attn_out * gate_scores  # [B, N_q, D]
-        out = self.out_proj(gated_out)  # [B, N_q, D]
-        updated_latents = latents + out  # [B, N_q, D]
-
-        if return_gate:
-            if return_gate_logits:
-                return updated_latents, gate_scores, gate_logits
-            return updated_latents, gate_scores
-        return updated_latents
+        attn_out = self.attn(latents_norm, context_norm, attn_mask=attn_mask)  # [B, Nq, D]
+        out = self.out_proj(attn_out)  # [B, Nq, D]
+        return latents + out  # [B, Nq, D]
 
 
 class Extruder(nn.Module):
     supports_gradient_checkpointing = True
 
-    def __init__(self, hidden_size,num_query_tokens=64,  nums_layers=3, num_heads=8,
-                 num_key_value_heads=2):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_query_tokens: int = 64,
+        nums_layers: int = 3,
+        num_heads: int = 8,
+        num_key_value_heads: int = 2,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_query_tokens = num_query_tokens
@@ -168,13 +162,13 @@ class Extruder(nn.Module):
         context: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        cls_pool = context[:, 0, :]
+        cls_pool = context[:, 0, :]  # [B, D]
         if attn_mask is None:
-            mean_pool = context.mean(dim=1)
+            mean_pool = context.mean(dim=1)  # [B, D]
         else:
-            mask = attn_mask.unsqueeze(-1).to(dtype=context.dtype)
-            mean_pool = (context * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
-        return torch.cat([cls_pool, mean_pool], dim=-1)
+            mask = attn_mask.unsqueeze(-1).to(dtype=context.dtype)  # [B, S, 1]
+            mean_pool = (context * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)  # [B, D]
+        return torch.cat([cls_pool, mean_pool], dim=-1)  # [B, 2D]
 
     def build_query_tokens(
         self,
@@ -182,10 +176,11 @@ class Extruder(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = context.shape[0]
-        conditioning = self._build_conditioning_vector(context, attn_mask=attn_mask)
-        delta = self.delta_mlp(conditioning).view(batch_size, self.num_query_tokens, self.hidden_size)
-        gate = torch.sigmoid(self.gate_mlp(conditioning)).view(batch_size, self.num_query_tokens, 1)
-        return self.query_tokens.expand(batch_size, -1, -1) + (gate * delta)
+        conditioning = self._build_conditioning_vector(context, attn_mask=attn_mask)  # [B, 2D]
+        delta = self.delta_mlp(conditioning).view(batch_size, self.num_query_tokens, self.hidden_size)  # [B, Nq, D]
+        gate = torch.sigmoid(self.gate_mlp(conditioning)).view(batch_size, self.num_query_tokens, 1)  # [B, Nq, 1]
+        base_queries = self.query_tokens.expand(batch_size, -1, -1)  # [B, Nq, D]
+        return base_queries + (gate * delta)  # [B, Nq, D]
 
     def _should_checkpoint(self, *tensors: Optional[torch.Tensor]) -> bool:
         if not self._gradient_checkpointing_enabled or not self.training:
@@ -201,106 +196,36 @@ class Extruder(nn.Module):
         self,
         context: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-        return_gate_scores: bool = False,
-        return_gate_logits: bool = False,
-    ) -> Union[
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ]:
+    ) -> torch.Tensor:
         """
-        Input: context [Batch, Doc_Len, Dim]
-        Output: latents [Batch, Num_Queries, Dim]
+        Input: context [B, S, D]
+        Output: latents [B, Nq, D]
         """
-        latents = self.build_query_tokens(context, attn_mask=attn_mask)
-
+        latents = self.build_query_tokens(context, attn_mask=attn_mask)  # [B, Nq, D]
 
         if attn_mask is not None:
             attn_mask = attn_mask.bool()
-            attn_mask = rearrange(attn_mask, 'B S -> B 1 1 S')  # [B, 1, 1, S_ctx]
+            attn_mask = rearrange(attn_mask, "B S -> B 1 1 S")  # [B, 1, 1, S]
 
-        # Iterative refinement
-        collected_gate_scores = []
-        collected_gate_logits = []
+        # Refine latent slots with cross-attention over the profiler context.  # [B, Nq, D]
         for layer in self.layers:
             should_checkpoint = self._should_checkpoint(latents, context)
-            if return_gate_scores:
-                if should_checkpoint:
-                    if attn_mask is None:
-                        def layer_forward(current_latents: torch.Tensor, current_context: torch.Tensor):
-                            return layer(
-                                current_latents,
-                                current_context,
-                                return_gate=True,
-                                return_gate_logits=return_gate_logits,
-                            )
+            if should_checkpoint:
+                if attn_mask is None:
+                    def layer_forward(current_latents: torch.Tensor, current_context: torch.Tensor):
+                        return layer(current_latents, current_context)
 
-                        layer_outputs = self._checkpoint_layer(layer_forward, latents, context)
-                    else:
-                        def layer_forward(
-                            current_latents: torch.Tensor,
-                            current_context: torch.Tensor,
-                            current_attn_mask: torch.Tensor,
-                        ):
-                            return layer(
-                                current_latents,
-                                current_context,
-                                attn_mask=current_attn_mask,
-                                return_gate=True,
-                                return_gate_logits=return_gate_logits,
-                            )
+                    latents = self._checkpoint_layer(layer_forward, latents, context)
+                else:
+                    def layer_forward(
+                        current_latents: torch.Tensor,
+                        current_context: torch.Tensor,
+                        current_attn_mask: torch.Tensor,
+                    ):
+                        return layer(current_latents, current_context, attn_mask=current_attn_mask)
 
-                        layer_outputs = self._checkpoint_layer(layer_forward, latents, context, attn_mask)
-                else:
-                    layer_outputs = layer(
-                        latents,
-                        context,
-                        attn_mask=attn_mask,
-                        return_gate=True,
-                        return_gate_logits=return_gate_logits,
-                    )
-                if return_gate_logits:
-                    latents, gate_scores, gate_logits = layer_outputs
-                    collected_gate_logits.append(gate_logits)  # each: [B, N_q, D]
-                else:
-                    latents, gate_scores = layer_outputs
-                collected_gate_scores.append(gate_scores)  # each: [B, N_q, D]
+                    latents = self._checkpoint_layer(layer_forward, latents, context, attn_mask)
             else:
-                if should_checkpoint:
-                    if attn_mask is None:
-                        def layer_forward(current_latents: torch.Tensor, current_context: torch.Tensor):
-                            return layer(current_latents, current_context)
+                latents = layer(latents, context, attn_mask=attn_mask)
 
-                        latents = self._checkpoint_layer(layer_forward, latents, context)
-                    else:
-                        def layer_forward(
-                            current_latents: torch.Tensor,
-                            current_context: torch.Tensor,
-                            current_attn_mask: torch.Tensor,
-                        ):
-                            return layer(current_latents, current_context, attn_mask=current_attn_mask)
-
-                        latents = self._checkpoint_layer(layer_forward, latents, context, attn_mask)
-                else:
-                    latents = layer(latents, context, attn_mask=attn_mask)
-
-        latents = self.final_norm(latents)  # [B, N_q, D]
-
-        if return_gate_scores:
-            if collected_gate_scores:
-                stacked_gate_scores = torch.stack(collected_gate_scores, dim=1)  # [B, L, N_q, D]
-            else:
-                stacked_gate_scores = latents.new_empty(
-                    (latents.shape[0], 0, self.num_query_tokens, self.hidden_size)
-                )
-            if return_gate_logits:
-                if collected_gate_logits:
-                    stacked_gate_logits = torch.stack(collected_gate_logits, dim=1)  # [B, L, N_q, D]
-                else:
-                    stacked_gate_logits = latents.new_empty(
-                        (latents.shape[0], 0, self.num_query_tokens, self.hidden_size)
-                    )
-                return latents, stacked_gate_scores, stacked_gate_logits
-            return latents, stacked_gate_scores
-
-        return latents
+        return self.final_norm(latents)  # [B, Nq, D]

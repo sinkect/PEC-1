@@ -13,14 +13,13 @@ EXIT_COMMANDS = {"/exit", "/quit", "exit", "quit"}
 MULTILINE_START_COMMANDS = {"/multiline", "/paste"}
 MULTILINE_SEND_COMMANDS = {"/send", "/submit", "/end"}
 MULTILINE_CANCEL_COMMANDS = {"/cancel", "/abort"}
-SOFT_PROMPT_SCALE_COMMANDS = {"/scale", "/soft-prompt-scale"}
 
 
 def parse_args() -> argparse.Namespace:
     base_dir = Path(__file__).resolve().parent
 
     parser = argparse.ArgumentParser(
-        description="Interactive chat/repl for base and PEC models with gate-score inspection."
+        description="Interactive chat/repl for base and PEC models with memory-KV inspection."
     )
     parser.add_argument("--mode", choices=["pec", "base", "compare"], default="pec")
     parser.add_argument("--base-model", type=str, default="Qwen/Qwen3-1.7B")
@@ -36,13 +35,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-id", type=int, default=None, help="CUDA GPU id to use. Defaults to current auto-detected device.")
     parser.add_argument("--show-raw", action="store_true", help="Print raw output even when it matches cleaned output.")
     parser.add_argument("--prompt", type=str, default=None, help="Run a single prompt once without interactive chat.")
-    parser.add_argument(
-        "--soft-prompt-scale",
-        type=float,
-        default=None,
-        help="Override PEC model soft_prompt_scale after loading for quick chat-time testing.",
-    )
-
     mask_group = parser.add_mutually_exclusive_group()
     mask_group.add_argument("--apply-mask", dest="apply_mask", action="store_true", help="Mask the composer-visible prompt like PEC masked eval.")
     mask_group.add_argument("--no-apply-mask", dest="apply_mask", action="store_false", help="Do not mask the composer-visible prompt.")
@@ -53,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         "--soft-prompt-only",
         dest="soft_prompt_only",
         action="store_true",
-        help="Hide the original text from the PEC composer and answer using only the profiler soft prompt.",
+        help="Hide the original text from the PEC composer and answer using only latent memory.",
     )
     composer_group.add_argument(
         "--with-visible-prompt",
@@ -86,26 +78,10 @@ def resolve_device(gpu_id: int | None) -> torch.device:
     return get_device()
 
 
-def get_soft_prompt_scale(model) -> float | None:
-    if model is None or not hasattr(model, "soft_prompt_scale"):
-        return None
-    return float(model.soft_prompt_scale.detach().item())
-
-
-def set_soft_prompt_scale(model, value: float) -> float:
-    if model is None or not hasattr(model, "soft_prompt_scale"):
-        raise ValueError("PEC model does not expose soft_prompt_scale.")
-
-    with torch.no_grad():
-        model.soft_prompt_scale.fill_(float(value))
-    return get_soft_prompt_scale(model)
-
-
 def print_header(
     args: argparse.Namespace,
     device: torch.device,
     sampling: dict[str, float],
-    pec_soft_prompt_scale: float | None = None,
 ) -> None:
     from models.eval_utils import thinking_mode_name
 
@@ -120,9 +96,9 @@ def print_header(
             f"top_k={sampling['top_k']}, min_p={sampling['min_p']}",
             flush=True,
         )
-    print(f"  Composer prompt: {'soft_prompt_only' if args.soft_prompt_only else 'visible_prompt'}", flush=True)
+    print(f"  Composer prompt: {'memory_only' if args.soft_prompt_only else 'visible_prompt'}", flush=True)
     if args.soft_prompt_only:
-        print("  Apply mask: False (ignored by soft_prompt_only)", flush=True)
+        print("  Apply mask: False (ignored by memory_only)", flush=True)
     else:
         print(f"  Apply mask: {args.apply_mask}", flush=True)
     if args.mode in {"base", "compare"}:
@@ -130,9 +106,7 @@ def print_header(
     if args.mode in {"pec", "compare"}:
         print(f"  PEC checkpoint: {args.pec_checkpoint_dir}", flush=True)
         print(f"  PEC composer model: {args.pec_composer_model}", flush=True)
-        if pec_soft_prompt_scale is not None:
-            print(f"  Soft prompt scale: {pec_soft_prompt_scale:.6f}", flush=True)
-    print("  Commands: /help, /multiline, /reset, /scale [value], /exit", flush=True)
+    print("  Commands: /help, /multiline, /reset, /exit", flush=True)
 
 
 def print_response_block(
@@ -143,26 +117,9 @@ def print_response_block(
     raw_prediction: str,
     cleaned_prediction: str,
     elapsed_seconds: float,
-    gate_stats: dict[str, Any] | None = None,
+    memory_stats: dict[str, Any] | None = None,
     show_raw: bool = False,
-    soft_prompt_scale: float | None = None,
 ) -> None:
-    def print_layer_query_table(title: str, layer_query_values: list[list[float]]) -> None:
-        if not layer_query_values:
-            print(f"  {title}: <none>", flush=True)
-            return
-
-        print(f"  {title} (hidden-mean):", flush=True)
-        chunk_size = 8
-        for layer_index, layer_values in enumerate(layer_query_values):
-            for start in range(0, len(layer_values), chunk_size):
-                chunk = layer_values[start:start + chunk_size]
-                query_tokens = ", ".join(
-                    f"q{query_index:02d}={value:.4f}"
-                    for query_index, value in enumerate(chunk, start=start)
-                )
-                print(f"    L{layer_index} {query_tokens}", flush=True)
-
     def print_tensor_slice(title: str, slice_values: list[list[float]]) -> None:
         if not slice_values:
             print(f"  {title}: <none>", flush=True)
@@ -183,44 +140,31 @@ def print_response_block(
     print(f"  Prediction: {cleaned_prediction}", flush=True)
     if show_raw or raw_prediction != cleaned_prediction:
         print(f"  Raw prediction: {raw_prediction}", flush=True)
-    if soft_prompt_scale is not None:
-        print(f"  Soft prompt scale: {soft_prompt_scale:.6f}", flush=True)
-    if gate_stats is not None:
+    if memory_stats is not None:
         print(
-            f"  Gate score: mean={gate_stats['gate_mean']:.6f}, "
-            f"max={gate_stats['gate_max']:.6f}",
+            f"  Latent Z: norm={memory_stats['latent_z_norm']:.6f}, "
+            f"mean={memory_stats['latent_z_mean']:.6f}, std={memory_stats['latent_z_std']:.6f}",
             flush=True,
         )
         print(
-            f"  Gate logits: mean={gate_stats['gate_logit_mean']:.6f}, "
-            f"abs_max={gate_stats['gate_logit_abs_max']:.6f}",
+            f"  Memory K: norm={memory_stats['memory_k_norm']:.6f}, "
+            f"mean={memory_stats['memory_k_mean']:.6f}, std={memory_stats['memory_k_std']:.6f}",
             flush=True,
         )
         print(
-            f"  Latent Z: norm={gate_stats['latent_z_norm']:.6f}, "
-            f"mean={gate_stats['latent_z_mean']:.6f}, std={gate_stats['latent_z_std']:.6f}",
+            f"  Memory V: norm={memory_stats['memory_v_norm']:.6f}, "
+            f"mean={memory_stats['memory_v_mean']:.6f}, std={memory_stats['memory_v_std']:.6f}",
             flush=True,
         )
-        print(
-            f"  Soft prompt P: norm={gate_stats['soft_prompt_p_norm']:.6f}, "
-            f"mean={gate_stats['soft_prompt_p_mean']:.6f}, std={gate_stats['soft_prompt_p_std']:.6f}",
-            flush=True,
-        )
-        print(
-            f"  projector_raw_std={gate_stats['projector_raw_std']:.6f}, "
-            f"final_P_std={gate_stats['final_p_std']:.6f}",
-            flush=True,
-        )
-        print_layer_query_table("Gate score by layer/query", gate_stats["gate_layer_query_mean"])
-        print_layer_query_table("Gate logits by layer/query", gate_stats["gate_logit_layer_query_mean"])
-        print_tensor_slice("P[0, :5, :8]", gate_stats["soft_prompt_p_slice"])
+        print(f"  Memory slots: {memory_stats['memory_slots']}", flush=True)
+        print_tensor_slice("K_mem[0, 0, :5, :8]", memory_stats["memory_key_slice"])
+        print_tensor_slice("V_mem[0, 0, :5, :8]", memory_stats["memory_value_slice"])
 
 
 def print_help() -> None:
     print("  /help  Show commands", flush=True)
     print("  /multiline  Enter multiline input mode; finish with /send or discard with /cancel", flush=True)
     print("  /reset Reset the turn counter used for deterministic masking", flush=True)
-    print("  /scale [value]  Show current PEC soft prompt scale or set it for subsequent turns", flush=True)
     print("  /exit  Quit", flush=True)
 
 
@@ -334,7 +278,7 @@ def run_one_turn(
 
     if args.mode in {"pec", "compare"}:
         started_at = time.perf_counter()
-        raw_pec_prediction, gate_stats = generate_pec_response(
+        raw_pec_prediction, memory_stats = generate_pec_response(
             model=pec_model,
             profiler_tokenizer=profiler_tokenizer,
             composer_tokenizer=composer_tokenizer,
@@ -360,9 +304,8 @@ def run_one_turn(
             raw_prediction=raw_pec_prediction,
             cleaned_prediction=cleaned_pec_prediction,
             elapsed_seconds=pec_elapsed,
-            gate_stats=gate_stats,
+            memory_stats=memory_stats,
             show_raw=args.show_raw,
-            soft_prompt_scale=get_soft_prompt_scale(pec_model),
         )
 
 
@@ -400,8 +343,6 @@ def main() -> None:
                 num_query_tokens=args.num_query_tokens,
                 device=device,
             )
-            if args.soft_prompt_scale is not None:
-                set_soft_prompt_scale(pec_model, args.soft_prompt_scale)
             if args.apply_mask:
                 masker = EntityMasker(mask_prob=args.mask_probability)
 
@@ -409,7 +350,6 @@ def main() -> None:
             args,
             device,
             sampling,
-            pec_soft_prompt_scale=get_soft_prompt_scale(pec_model),
         )
 
         if args.prompt is not None:
@@ -469,25 +409,6 @@ def main() -> None:
             if command == "/reset":
                 turn_index = 0
                 print("Turn counter reset.", flush=True)
-                continue
-            if command.split(maxsplit=1)[0] in SOFT_PROMPT_SCALE_COMMANDS:
-                if pec_model is None:
-                    print("Soft prompt scale is only available in PEC/compare mode.", flush=True)
-                    continue
-
-                parts = command.split(maxsplit=1)
-                if len(parts) == 1:
-                    current_value = get_soft_prompt_scale(pec_model)
-                    print(f"Current soft prompt scale: {current_value:.6f}", flush=True)
-                    continue
-
-                try:
-                    updated_value = set_soft_prompt_scale(pec_model, float(parts[1]))
-                except ValueError:
-                    print("Usage: /scale <float>", flush=True)
-                    continue
-
-                print(f"Soft prompt scale updated to {updated_value:.6f}", flush=True)
                 continue
             if command in MULTILINE_START_COMMANDS:
                 user_input = read_multiline_input()

@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from torch.utils.data import Dataset, Subset
 from transformers import (
     AutoTokenizer,
     EarlyStoppingCallback,
+    Trainer,
     TrainerCallback,
     TrainingArguments,
 )
@@ -23,11 +25,9 @@ from models.data import PECDataset, PECCollator, EntityMasker, SharedMaskProbabi
 from models.dataset_mixing import (
     BlendResult,
     load_stage1_blended_dataset,
-    load_stage23_blended_dataset,
     save_blend_metadata,
     save_sampled_by_source_as_jsonl,
 )
-from models.losses import GateL1Trainer
 
 
 @dataclass(frozen=True)
@@ -52,17 +52,38 @@ def parse_args() -> argparse.Namespace:
         "--stages",
         nargs="+",
         choices=["stage1", "stage23", "stage2", "stage3"],
-        default=["stage1", "stage23"],
+        default=["stage1"],
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-ratio", type=float, default=0.02)
 
-    parser.add_argument("--stage1-train-samples", type=int, default=30_000)
-    parser.add_argument("--stage23-train-samples", type=int, default=200_000)
-    parser.add_argument("--stage23-mask-prob-start", type=float, default=0.7)
-    parser.add_argument("--stage23-mask-prob-end", type=float, default=0.2)
+    parser.add_argument(
+        "--stage1-train-samples",
+        "--stage2-train-samples",
+        "--stage23-train-samples",
+        dest="stage1_train_samples",
+        type=int,
+        default=200_000,
+    )
+    parser.add_argument(
+        "--stage1-mask-prob-start",
+        "--stage2-mask-prob-start",
+        "--stage23-mask-prob-start",
+        dest="stage1_mask_prob_start",
+        type=float,
+        default=0.7,
+    )
+    parser.add_argument(
+        "--stage1-mask-prob-end",
+        "--stage2-mask-prob-end",
+        "--stage23-mask-prob-end",
+        dest="stage1_mask_prob_end",
+        type=float,
+        default=0.2,
+    )
     parser.add_argument("--process-name", type=str, default="pec_training")
-    parser.add_argument("--num-query-tokens", type=int, default=64)
+    parser.add_argument("--num-query-tokens", type=int, default=16, help="Number of latent memory slots.")
+    parser.add_argument("--memory-upper-layers", type=int, default=8)
     parser.add_argument(
         "--freeze-profiler",
         action=argparse.BooleanOptionalAction,
@@ -74,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument("--num-train-epochs", type=float, default=2.0)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=-1,
+        help="Maximum training steps per stage. When > 0, overrides --num-train-epochs.",
+    )
     parser.add_argument(
         "--gradient-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -92,7 +119,7 @@ def parse_args() -> argparse.Namespace:
         "--projector-learning-rate",
         type=float,
         default=None,
-        help="Optional override for Projector LR. Defaults to --learning-rate when unset.",
+        help="Optional override for memory-projector LR. Defaults to --learning-rate when unset.",
     )
     parser.add_argument("--profiler-learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -103,13 +130,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument("--save-total-limit", type=int, default=2)
     parser.add_argument("--early-stopping-patience", type=int, default=2)
-    parser.add_argument("--gate-l1-max-lambda", type=float, default=2e-4)
-    parser.add_argument("--gate-l1-warmup-ratio", type=float, default=0.3)
-    parser.add_argument("--projector-raw-l2-lambda", type=float, default=1e-5)
     parser.add_argument(
         "--morehop-align-lambda",
         type=float,
-        default=0.1,
+        default=0.01,
         help="Lambda for the MoreHopQA z_pool alignment auxiliary loss.",
     )
     parser.add_argument(
@@ -192,7 +216,7 @@ def split_dataset_indices(dataset_len: int, test_size: float = 0.02, seed: int =
 def normalize_stage_names(stage_names: List[str]) -> List[str]:
     normalized: List[str] = []
     for stage_name in stage_names:
-        canonical_name = "stage23" if stage_name in {"stage2", "stage3"} else stage_name
+        canonical_name = "stage1" if stage_name in {"stage1", "stage2", "stage23", "stage3"} else stage_name
         if canonical_name not in normalized:
             normalized.append(canonical_name)
     return normalized
@@ -202,19 +226,11 @@ def get_stage_specs(args: argparse.Namespace) -> Dict[str, StageSpec]:
     return {
         "stage1": StageSpec(
             name="stage1",
-            visible_prompt_mode="empty",
-            train_samples=args.stage1_train_samples,
-            with_replacement=False,
-            mask_prob_start=None,
-            mask_prob_end=None,
-        ),
-        "stage23": StageSpec(
-            name="stage23",
             visible_prompt_mode="masked",
-            train_samples=args.stage23_train_samples,
+            train_samples=args.stage1_train_samples,
             with_replacement=True,
-            mask_prob_start=args.stage23_mask_prob_start,
-            mask_prob_end=args.stage23_mask_prob_end,
+            mask_prob_start=args.stage1_mask_prob_start,
+            mask_prob_end=args.stage1_mask_prob_end,
         ),
     }
 
@@ -262,6 +278,180 @@ class MaskingCurriculumCallback(TrainerCallback):
         return control
 
 
+FIXED_SAMPLE_PROMPTS = [
+    {
+        "name": "hello",
+        "prompt": "hello",
+    },
+    {
+        "name": "ueda_pond",
+        "prompt": (
+            "What is the historical significance of the pond lowered by one shaku as specified by the lord "
+            "of the Ueda Domain? How did this decision impact the surrounding area and the people living "
+            "there?\n\n"
+            "Context:\n"
+            "Yamada Pond was the largest reservoir in Shiodadaira until Sawayama Pond was made in 1938.\n"
+            "The pond has a long history, and while the date of its construction is unknown, in 1650, two "
+            "ponds that were side by side were combined to form the present pond. The following story remains "
+            "from when that work was done.\n"
+            "Before construction, the lord of the Ueda Domain looked over the plans, saying, \"If we make such "
+            "a large pond, there's a possibility Ueda Castle and the town could be damaged if the embankments "
+            "were to break, so make the embankments one shaku (about 30 cm/1 foot) lower.\" Making the "
+            "embankments even one shaku higher would make the reservoir hold much more water. But if the "
+            "embankments were to break for some reason, a vast amount of water would assail the castle and town. "
+            "As a result, the embankments were lowered by one shaku and Yamada Pond was made.\n"
+            "Around 1840, carp were raised at this pond, and the Ueda Domain grew medicinal plants as a "
+            "business in a 3,000 tsubo (1 hectare/2.45 acre) herb garden on the shores of the pond.\n"
+            "Yamada Pond was constructed straddling Yagisawa and Yamada lands, but the person who oversaw all "
+            "construction on the pond came from \"Yamada in Ise (present day Mie Prefecture),\" so it is said "
+            "he took that place name and named the pond after it. At Yagisawa Funakubo, from where you can "
+            "overlook the entire pond, is enshrined Amaterasu, which is said to have been brought from Ise "
+            "Shrine, the highest rank shrine in the country, as a guardian deity for the pond.\n"
+            "|address||Yagisawa, Ueda City|"
+        ),
+    },
+]
+
+
+class FixedSampleGenerationCallback(TrainerCallback):
+    def __init__(
+            self,
+            *,
+            stage_name: str,
+            stage_output_dir: Path,
+            profiler_tokenizer,
+            composer_tokenizer,
+            visible_prompt_mode: str,
+            query_masker,
+            max_profiler_len: int,
+            max_composer_len: int,
+            every_steps: int = 500,
+            max_new_tokens: int = 128,
+    ) -> None:
+        self.stage_name = stage_name
+        self.stage_output_dir = stage_output_dir
+        self.profiler_tokenizer = profiler_tokenizer
+        self.composer_tokenizer = composer_tokenizer
+        self.visible_prompt_mode = visible_prompt_mode
+        self.query_masker = query_masker
+        self.max_profiler_len = max_profiler_len
+        self.max_composer_len = max_composer_len
+        self.every_steps = int(every_steps)
+        self.max_new_tokens = int(max_new_tokens)
+        self.output_path = self.stage_output_dir / "sample_generations.jsonl"
+
+    def _build_visible_prompt(self, prompt: str) -> str:
+        if self.visible_prompt_mode == "full":
+            return prompt
+        if self.visible_prompt_mode == "empty":
+            return ""
+        if self.visible_prompt_mode == "masked":
+            if self.query_masker is None:
+                raise ValueError("query_masker is required for masked sample generation.")
+            previous_random_state = random.getstate()
+            random.seed(0)
+            try:
+                return self.query_masker(prompt)
+            finally:
+                random.setstate(previous_random_state)
+        raise ValueError(f"Unsupported visible_prompt_mode: {self.visible_prompt_mode}")
+
+    def _build_composer_prompt_text(self, visible_prompt: str) -> str:
+        return self.composer_tokenizer.apply_chat_template(
+            [{"role": "user", "content": visible_prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+
+    def _generate_completion(self, model: PECEngine, prompt: str) -> Dict[str, str]:
+        visible_prompt = self._build_visible_prompt(prompt)
+        composer_prompt_text = self._build_composer_prompt_text(visible_prompt)
+
+        profiler_inputs = self.profiler_tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_profiler_len,
+        )
+        composer_inputs = self.composer_tokenizer(
+            composer_prompt_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_composer_len,
+        )
+
+        generated_ids = model.generate_with_memory(
+            profiler_input_ids=profiler_inputs["input_ids"],
+            profiler_attention_mask=profiler_inputs["attention_mask"],
+            composer_input_ids=composer_inputs["input_ids"],
+            composer_attention_mask=composer_inputs["attention_mask"],
+            max_new_tokens=self.max_new_tokens,
+        )
+        generation = self.composer_tokenizer.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+        )[0].strip()
+
+        return {
+            "prompt": prompt,
+            "visible_prompt": visible_prompt,
+            "generation": generation,
+        }
+
+    def _write_record(self, record: Dict[str, Any]) -> None:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.output_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        del args
+        if self.every_steps <= 0:
+            return control
+        if int(getattr(state, "global_step", 0) or 0) <= 0:
+            return control
+        if int(state.global_step) % self.every_steps != 0:
+            return control
+        if not bool(getattr(state, "is_world_process_zero", True)):
+            return control
+
+        model = kwargs.get("model")
+        if model is None:
+            return control
+        if hasattr(model, "module"):
+            model = model.module
+        if not isinstance(model, PECEngine):
+            return control
+
+        previous_training_mode = model.training
+        model.eval()
+        try:
+            samples = []
+            for sample_spec in FIXED_SAMPLE_PROMPTS:
+                sample_output = self._generate_completion(model, sample_spec["prompt"])
+                sample_output["name"] = sample_spec["name"]
+                samples.append(sample_output)
+        finally:
+            if previous_training_mode:
+                model.train()
+
+        record = {
+            "stage": self.stage_name,
+            "global_step": int(state.global_step),
+            "samples": samples,
+        }
+        self._write_record(record)
+
+        print(
+            f"[sample_generation stage={self.stage_name} step={int(state.global_step)}] "
+            f"saved to {self.output_path}",
+            flush=True,
+        )
+        for sample in samples:
+            print(f"[sample_generation:{sample['name']}] {sample['generation']}", flush=True)
+        return control
+
+
 def load_blend_for_stage(
         stage: StageSpec,
         seed: int,
@@ -269,17 +459,7 @@ def load_blend_for_stage(
         max_profiler_tokens: int,
         max_composer_tokens: int,
 ) -> BlendResult:
-    if stage.name == "stage1":
-        return load_stage1_blended_dataset(
-            split="train",
-            seed=seed,
-            epoch_size=stage.train_samples,
-            with_replacement=stage.with_replacement,
-            max_profiler_tokens=max_profiler_tokens,
-            max_composer_tokens=max_composer_tokens,
-        )
-
-    return load_stage23_blended_dataset(
+    return load_stage1_blended_dataset(
         split="train",
         seed=seed,
         epoch_size=stage.train_samples,
@@ -348,6 +528,7 @@ def build_training_arguments(args: argparse.Namespace, output_dir: Path, device:
     return TrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=args.gradient_checkpoint,
@@ -384,8 +565,12 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
     named_parameters = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
     profiler_params = [parameter for name, parameter in named_parameters if name.startswith("profiler.")]
     extruder_params = [parameter for name, parameter in named_parameters if name.startswith("extruder.")]
-    projector_params = [parameter for name, parameter in named_parameters if name.startswith("projector.")]
-    covered_prefixes = ("profiler.", "extruder.", "projector.")
+    projector_params = [
+        parameter
+        for name, parameter in named_parameters
+        if name.startswith("k_mem_proj.") or name.startswith("v_mem_proj.")
+    ]
+    covered_prefixes = ("profiler.", "extruder.", "k_mem_proj.", "v_mem_proj.")
     misc_params = [
         parameter
         for name, parameter in named_parameters
@@ -455,8 +640,8 @@ def initialize_model_from_checkpoint(model: PECEngine, checkpoint_dir: Path) -> 
         if not (
             key.startswith("composer.")
             or key.startswith("profiler.")
-            or key.startswith("prev_span_head.")
-            or key.startswith("expr_head.")
+            or key.startswith("k_mem_proj.")
+            or key.startswith("v_mem_proj.")
         )
     ]
     if critical_missing:
@@ -464,9 +649,10 @@ def initialize_model_from_checkpoint(model: PECEngine, checkpoint_dir: Path) -> 
     filtered_unexpected_keys = [
         key for key in unexpected_keys
         if not (
-            key.startswith("prev_sent_head.")
-            or key.startswith("prev_span_head.")
-            or key.startswith("expr_head.")
+            key.startswith("projector.")
+            or key == "soft_prompt_scale"
+            or key == "sep_token"
+            or ".gate_proj." in key
         )
     ]
     if filtered_unexpected_keys:
@@ -482,7 +668,7 @@ def _checkpoint_sort_key(checkpoint_dir: Path) -> int:
         return -1
 
 
-def _resolve_resumable_checkpoint_source(trainer: GateL1Trainer, stage_output_dir: Path) -> Optional[Path]:
+def _resolve_resumable_checkpoint_source(trainer: Trainer, stage_output_dir: Path) -> Optional[Path]:
     best_checkpoint = getattr(trainer.state, "best_model_checkpoint", None)
     if best_checkpoint is not None:
         best_checkpoint_path = Path(best_checkpoint)
@@ -499,7 +685,7 @@ def _resolve_resumable_checkpoint_source(trainer: GateL1Trainer, stage_output_di
 
 
 def save_resumable_final_checkpoint(
-        trainer: GateL1Trainer,
+        trainer: Trainer,
         *,
         stage_output_dir: Path,
         final_output_dir: Path,
@@ -560,6 +746,7 @@ def main() -> None:
         morehop_align_lambda=args.morehop_align_lambda,
         freeze_profiler=args.freeze_profiler,
         freeze_extruder=args.freeze_extruder,
+        memory_upper_layers=args.memory_upper_layers,
     )
     if args.init_from_checkpoint is not None:
         initialize_model_from_checkpoint(model, args.init_from_checkpoint)
@@ -576,13 +763,10 @@ def main() -> None:
         stage = stage_specs[stage_name]
         stage_output_dir = args.output_dir / stage.name
         print(f"\n===== {stage.name.upper()} =====")
-        if stage.mask_prob_start is None:
-            print("Composer visible prompt: soft prompt only")
-        else:
-            print(
-                "Composer visible prompt mask curriculum: "
-                f"{stage.mask_prob_start:.4f} -> {stage.mask_prob_end:.4f}"
-            )
+        print(
+            "Composer visible prompt mask curriculum: "
+            f"{stage.mask_prob_start:.4f} -> {stage.mask_prob_end:.4f}"
+        )
 
         blend_result = load_blend_for_stage(
             stage,
@@ -619,17 +803,28 @@ def main() -> None:
                     end_prob=stage.mask_prob_end,
                 )
             )
+        callbacks.append(
+            FixedSampleGenerationCallback(
+                stage_name=stage.name,
+                stage_output_dir=stage_output_dir,
+                profiler_tokenizer=profiler_tokenizer,
+                composer_tokenizer=composer_tokenizer,
+                visible_prompt_mode=stage.visible_prompt_mode,
+                query_masker=train_dataset.query_masker,
+                max_profiler_len=args.max_profiler_len,
+                max_composer_len=args.max_composer_len,
+                every_steps=500,
+                max_new_tokens=128,
+            )
+        )
 
-        trainer = GateL1Trainer(
+        trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             data_collator=data_collator,
             optimizers=(optimizer, None),
-            gate_l1_max_lambda=args.gate_l1_max_lambda,
-            gate_l1_warmup_ratio=args.gate_l1_warmup_ratio,
-            projector_raw_l2_lambda=args.projector_raw_l2_lambda,
             callbacks=callbacks,
         )
 

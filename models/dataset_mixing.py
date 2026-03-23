@@ -728,39 +728,18 @@ def load_stage1_blended_dataset(
     *,
     split: str = "train",
     seed: int = 42,
-    epoch_size: int = 30_000,
-    with_replacement: bool = False,
-    max_profiler_tokens: int = 6144,
-    max_composer_tokens: int = 6144,
-) -> BlendResult:
-    """Loads the 30k Stage 1 blend with LongMagpie-heavy sampling."""
-    return load_blended_dataset(
-        split=split,
-        seed=seed,
-        epoch_size=epoch_size,
-        with_replacement=with_replacement,
-        ratios=[2, 7, 1],
-        max_profiler_tokens=max_profiler_tokens,
-        max_composer_tokens=max_composer_tokens,
-    )
-
-
-def load_stage23_blended_dataset(
-    *,
-    split: str = "train",
-    seed: int = 42,
     epoch_size: int = 200_000,
     with_replacement: bool = True,
     max_profiler_tokens: int = 6144,
     max_composer_tokens: int = 6144,
 ) -> BlendResult:
-    """Loads the Stage 2/3 blend with MoreHopQA/HARP/NQ-short 50/35/15 sampling."""
+    """Loads the Stage 1 blend with MoreHopQA/HARP/NQ-short 50/35/15 sampling."""
     del max_profiler_tokens, max_composer_tokens
     if load_dataset is None:
         raise ModuleNotFoundError("The 'datasets' package is required to load blended datasets.")
 
     _dataset_log(
-        "Loading Stage 23 datasets "
+        "Loading Stage 1 datasets "
         f"(split={split}, ratios=[50, 35, 15])"
     )
     morehopqa_hf = _load_morehopqa_dataset(split="test")
@@ -780,7 +759,7 @@ def load_stage23_blended_dataset(
         )
 
     _dataset_log(
-        "Stage 23 sources loaded: "
+        "Stage 1 sources loaded: "
         f"morehopqa={len(morehopqa_hf)}, "
         f"harp={len(harp_hf)}, "
         f"nq_short={len(nq_short_hf)}"
@@ -797,6 +776,46 @@ def load_stage23_blended_dataset(
         epoch_size=epoch_size,
         with_replacement=with_replacement,
         source_names=["morehopqa", "harp", "nq_short"],
+    )
+
+
+def load_stage2_blended_dataset(
+    *,
+    split: str = "train",
+    seed: int = 42,
+    epoch_size: int = 200_000,
+    with_replacement: bool = True,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
+) -> BlendResult:
+    """Compatibility alias for the legacy Stage 2 loader name."""
+    return load_stage1_blended_dataset(
+        split=split,
+        seed=seed,
+        epoch_size=epoch_size,
+        with_replacement=with_replacement,
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
+    )
+
+
+def load_stage23_blended_dataset(
+    *,
+    split: str = "train",
+    seed: int = 42,
+    epoch_size: int = 200_000,
+    with_replacement: bool = True,
+    max_profiler_tokens: int = 6144,
+    max_composer_tokens: int = 6144,
+) -> BlendResult:
+    """Compatibility alias for the legacy merged Stage 23 loader name."""
+    return load_stage1_blended_dataset(
+        split=split,
+        seed=seed,
+        epoch_size=epoch_size,
+        with_replacement=with_replacement,
+        max_profiler_tokens=max_profiler_tokens,
+        max_composer_tokens=max_composer_tokens,
     )
 
 
