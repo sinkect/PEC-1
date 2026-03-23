@@ -1,6 +1,6 @@
 import multiprocessing as mp
 import random
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # Optional for lightweight tests/utilities.
 
 
 
-PromptMasker = Callable[[str], str]
+PromptMasker = Callable[..., str]
 
 
 class SharedMaskProbability:
@@ -32,7 +32,7 @@ class SharedMaskProbability:
 
 
 class EntityMasker:
-    """Applies selective masking to text, targeting content-bearing tokens."""
+    """Applies sample-aware masking, with span-priority masking for MoreHopQA."""
 
     def __init__(
         self,
@@ -40,6 +40,8 @@ class EntityMasker:
         mask_token: str = "[MASK]",
         mask_prob: float = 0.4,
         shared_mask_prob: Optional[SharedMaskProbability] = None,
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        target_span_mask_prob: float = 0.5,
     ):
         try:
             import spacy
@@ -54,6 +56,8 @@ class EntityMasker:
         self.mask_token = mask_token
         self.mask_prob = mask_prob
         self.shared_mask_prob = shared_mask_prob
+        self.tokenizer = tokenizer
+        self.target_span_mask_prob = float(target_span_mask_prob)
 
     def get_mask_prob(self) -> float:
         if self.shared_mask_prob is not None:
@@ -65,7 +69,32 @@ class EntityMasker:
         if self.shared_mask_prob is not None:
             self.shared_mask_prob.set(value)
 
-    def __call__(self, text: str) -> str:
+    @staticmethod
+    def _find_all_substring_spans(text: str, substring: str) -> List[Tuple[int, int]]:
+        if not text or not substring:
+            return []
+
+        spans: List[Tuple[int, int]] = []
+        search_start = 0
+        while True:
+            match_index = text.find(substring, search_start)
+            if match_index < 0:
+                break
+            spans.append((match_index, match_index + len(substring)))
+            search_start = match_index + len(substring)
+        return spans
+
+    @staticmethod
+    def _merge_spans(spans: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        merged: List[Tuple[int, int]] = []
+        for start, end in sorted(spans):
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
+                continue
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        return merged
+
+    def _mask_with_entity_policy(self, text: str) -> str:
         doc = self.nlp(text)
         mask_prob = self.get_mask_prob()
         tokens = []
@@ -76,6 +105,131 @@ class EntityMasker:
             else:
                 tokens.append(token.text)
         return " ".join(tokens)
+
+    def _resolve_morehop_char_spans(
+        self,
+        text: str,
+        target_texts: Sequence[str] | None,
+    ) -> List[Tuple[int, int]]:
+        if not target_texts:
+            return []
+
+        spans: List[Tuple[int, int]] = []
+        for target_text in target_texts:
+            if not target_text:
+                continue
+            spans.extend(self._find_all_substring_spans(text, str(target_text)))
+        return self._merge_spans(spans)
+
+    def _tokenize_with_offsets(self, text: str) -> Optional[List[Tuple[int, int]]]:
+        if self.tokenizer is None:
+            return None
+
+        try:
+            tokenized = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+        except (TypeError, ValueError):
+            return None
+
+        offset_mapping = tokenized.get("offset_mapping")
+        if offset_mapping is None:
+            return None
+        return [tuple(offset) for offset in offset_mapping]
+
+    def _mask_morehop_text(
+        self,
+        text: str,
+        *,
+        target_texts: Sequence[str] | None,
+    ) -> str:
+        # Convert the prompt into token offsets so we can map answer-string matches
+        # from character spans to token spans before masking.
+        offset_mapping = self._tokenize_with_offsets(text)
+        if not offset_mapping:
+            return self._mask_with_entity_policy(text)
+
+        # Find every occurrence of the grounded support answers in the raw prompt.
+        char_spans = self._resolve_morehop_char_spans(text, target_texts)
+        target_flags: List[bool] = []
+        for token_start, token_end in offset_mapping:
+            if token_end <= token_start:
+                target_flags.append(False)
+                continue
+            target_flags.append(
+                any(token_start < span_end and token_end > span_start for span_start, span_end in char_spans)
+            )
+
+        # Collapse adjacent target tokens into contiguous ranges so each support answer
+        # span is masked as a unit instead of token-by-token.
+        target_ranges: Dict[int, int] = {}
+        token_index = 0
+        while token_index < len(target_flags):
+            if not target_flags[token_index]:
+                token_index += 1
+                continue
+            range_start = token_index
+            token_index += 1
+            while token_index < len(target_flags) and target_flags[token_index]:
+                token_index += 1
+            target_ranges[range_start] = token_index
+
+        pieces: List[str] = []
+        previous_end = 0
+        base_mask_prob = self.get_mask_prob()
+        token_index = 0
+        while token_index < len(offset_mapping):
+            token_start, token_end = offset_mapping[token_index]
+            if token_end <= token_start:
+                token_index += 1
+                continue
+
+            if token_start > previous_end:
+                pieces.append(text[previous_end:token_start])
+
+            span_end_index = target_ranges.get(token_index)
+            if span_end_index is not None:
+                # Target spans get the higher masking probability to bias the visible
+                # prompt toward hiding grounded intermediate answers.
+                span_end = offset_mapping[span_end_index - 1][1]
+                if self.target_span_mask_prob >= 1.0:
+                    pieces.append(self.mask_token)
+                elif self.target_span_mask_prob <= 0.0:
+                    pieces.append(text[token_start:span_end])
+                elif random.random() < self.target_span_mask_prob:
+                    pieces.append(self.mask_token)
+                else:
+                    pieces.append(text[token_start:span_end])
+                previous_end = span_end
+                token_index = span_end_index
+                continue
+
+            # Non-target tokens still receive low-probability random masking so the
+            # model does not overfit to only one masking pattern.
+            if base_mask_prob >= 1.0:
+                pieces.append(self.mask_token)
+            elif base_mask_prob <= 0.0:
+                pieces.append(text[token_start:token_end])
+            elif random.random() < base_mask_prob:
+                pieces.append(self.mask_token)
+            else:
+                pieces.append(text[token_start:token_end])
+            previous_end = token_end
+            token_index += 1
+
+        if previous_end < len(text):
+            pieces.append(text[previous_end:])
+        return "".join(pieces)
+
+    def __call__(self, text: str, *, item: Optional[Dict[str, Any]] = None) -> str:
+        if item is not None and item.get("task_type") == "morehopqa":
+            return self._mask_morehop_text(
+                text,
+                target_texts=item.get("mh_target_texts"),
+            )
+        return self._mask_with_entity_policy(text)
 
 
 class PECDataset(Dataset):
@@ -113,6 +267,7 @@ class PECDataset(Dataset):
         *,
         mode: str,
         masker: Optional[PromptMasker],
+        item: Optional[Dict[str, Any]] = None,
     ) -> str:
         if mode == "full":
             return prompt
@@ -121,7 +276,10 @@ class PECDataset(Dataset):
         if mode == "masked":
             if masker is None:
                 raise ValueError("query_masker is required when visible_prompt_mode='masked'.")
-            return masker(prompt)
+            try:
+                return masker(prompt, item=item)
+            except TypeError:
+                return masker(prompt)
         raise ValueError(f"Unsupported visible_prompt_mode: {mode}")
 
     def _build_composer_texts(self, visible_prompt: str, answer: str) -> Dict[str, str]:
@@ -155,6 +313,7 @@ class PECDataset(Dataset):
             prompt,
             mode=self.visible_prompt_mode,
             masker=self.query_masker,
+            item=item,
         )
         composer_texts = self._build_composer_texts(visible_prompt, answer)
 

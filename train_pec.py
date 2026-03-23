@@ -124,6 +124,12 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Lambda for the MoreHopQA z_pool alignment auxiliary loss.",
     )
+    parser.add_argument(
+        "--morehop-target-span-mask-prob",
+        type=float,
+        default=0.5,
+        help="Mask probability for MoreHopQA support-answer token spans.",
+    )
     parser.add_argument("--max-profiler-len", type=int, default=6080)
     parser.add_argument("--max-composer-len", type=int, default=6080)
     return parser.parse_args()
@@ -302,6 +308,7 @@ def build_stage_datasets(
         composer_tokenizer,
         eval_ratio: float,
         seed: int,
+        morehop_target_span_mask_prob: float,
 ):
     split_indices = split_dataset_indices(len(base_dataset), test_size=eval_ratio, seed=seed)
     train_base = Subset(base_dataset, split_indices["train"])
@@ -313,9 +320,15 @@ def build_stage_datasets(
         train_masker = EntityMasker(
             mask_prob=stage.mask_prob_start,
             shared_mask_prob=shared_mask_prob,
+            tokenizer=composer_tokenizer,
+            target_span_mask_prob=morehop_target_span_mask_prob,
         )
         eval_mask_prob = stage.mask_prob_end if stage.mask_prob_end is not None else stage.mask_prob_start
-        eval_masker = EntityMasker(mask_prob=eval_mask_prob)
+        eval_masker = EntityMasker(
+            mask_prob=eval_mask_prob,
+            tokenizer=composer_tokenizer,
+            target_span_mask_prob=morehop_target_span_mask_prob,
+        )
     else:
         train_masker = None
         eval_masker = None
@@ -600,6 +613,7 @@ def main() -> None:
             composer_tokenizer=composer_tokenizer,
             eval_ratio=args.eval_ratio,
             seed=args.seed,
+            morehop_target_span_mask_prob=args.morehop_target_span_mask_prob,
         )
 
         training_args = build_training_arguments(args, stage_output_dir, device)
