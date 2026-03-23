@@ -42,6 +42,7 @@ class EntityMasker:
         shared_mask_prob: Optional[SharedMaskProbability] = None,
         tokenizer: Optional[PreTrainedTokenizer] = None,
         target_span_mask_prob: float = 0.5,
+        morehop_base_mask_prob: float = 0.1,
     ):
         try:
             import spacy
@@ -58,6 +59,7 @@ class EntityMasker:
         self.shared_mask_prob = shared_mask_prob
         self.tokenizer = tokenizer
         self.target_span_mask_prob = float(target_span_mask_prob)
+        self.morehop_base_mask_prob = float(morehop_base_mask_prob)
 
     def get_mask_prob(self) -> float:
         if self.shared_mask_prob is not None:
@@ -178,7 +180,9 @@ class EntityMasker:
 
         pieces: List[str] = []
         previous_end = 0
-        base_mask_prob = self.get_mask_prob()
+        # MoreHopQA uses a dedicated low-probability background masking rate for
+        # non-target tokens so masking stays concentrated on grounded sub-answer spans.
+        base_mask_prob = self.morehop_base_mask_prob
         token_index = 0
         while token_index < len(offset_mapping):
             token_start, token_end = offset_mapping[token_index]

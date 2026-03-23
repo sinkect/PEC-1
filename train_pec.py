@@ -59,20 +59,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--stage1-train-samples", type=int, default=30_000)
     parser.add_argument("--stage23-train-samples", type=int, default=200_000)
-    parser.add_argument(
-        "--stage2-mask-prob",
-        type=float,
-        default=0.7,
-        help="Backward-compatible alias for the curriculum start mask probability.",
-    )
-    parser.add_argument(
-        "--stage3-mask-prob",
-        type=float,
-        default=0.2,
-        help="Backward-compatible alias for the curriculum end mask probability.",
-    )
-    parser.add_argument("--stage23-mask-prob-start", type=float, default=None)
-    parser.add_argument("--stage23-mask-prob-end", type=float, default=None)
+    parser.add_argument("--stage23-mask-prob-start", type=float, default=0.7)
+    parser.add_argument("--stage23-mask-prob-end", type=float, default=0.2)
     parser.add_argument("--process-name", type=str, default="pec_training")
     parser.add_argument("--num-query-tokens", type=int, default=64)
     parser.add_argument(
@@ -130,8 +118,14 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Mask probability for MoreHopQA support-answer token spans.",
     )
-    parser.add_argument("--max-profiler-len", type=int, default=6080)
-    parser.add_argument("--max-composer-len", type=int, default=6080)
+    parser.add_argument(
+        "--morehop-base-mask-prob",
+        type=float,
+        default=0.1,
+        help="Background random masking probability for non-target MoreHopQA tokens.",
+    )
+    parser.add_argument("--max-profiler-len", type=int, default=6144)
+    parser.add_argument("--max-composer-len", type=int, default=6144)
     return parser.parse_args()
 
 
@@ -205,12 +199,6 @@ def normalize_stage_names(stage_names: List[str]) -> List[str]:
 
 
 def get_stage_specs(args: argparse.Namespace) -> Dict[str, StageSpec]:
-    stage23_mask_prob_start = (
-        args.stage23_mask_prob_start if args.stage23_mask_prob_start is not None else args.stage2_mask_prob
-    )
-    stage23_mask_prob_end = (
-        args.stage23_mask_prob_end if args.stage23_mask_prob_end is not None else args.stage3_mask_prob
-    )
     return {
         "stage1": StageSpec(
             name="stage1",
@@ -225,8 +213,8 @@ def get_stage_specs(args: argparse.Namespace) -> Dict[str, StageSpec]:
             visible_prompt_mode="masked",
             train_samples=args.stage23_train_samples,
             with_replacement=True,
-            mask_prob_start=stage23_mask_prob_start,
-            mask_prob_end=stage23_mask_prob_end,
+            mask_prob_start=args.stage23_mask_prob_start,
+            mask_prob_end=args.stage23_mask_prob_end,
         ),
     }
 
@@ -309,6 +297,7 @@ def build_stage_datasets(
         eval_ratio: float,
         seed: int,
         morehop_target_span_mask_prob: float,
+        morehop_base_mask_prob: float,
 ):
     split_indices = split_dataset_indices(len(base_dataset), test_size=eval_ratio, seed=seed)
     train_base = Subset(base_dataset, split_indices["train"])
@@ -322,12 +311,14 @@ def build_stage_datasets(
             shared_mask_prob=shared_mask_prob,
             tokenizer=composer_tokenizer,
             target_span_mask_prob=morehop_target_span_mask_prob,
+            morehop_base_mask_prob=morehop_base_mask_prob,
         )
         eval_mask_prob = stage.mask_prob_end if stage.mask_prob_end is not None else stage.mask_prob_start
         eval_masker = EntityMasker(
             mask_prob=eval_mask_prob,
             tokenizer=composer_tokenizer,
             target_span_mask_prob=morehop_target_span_mask_prob,
+            morehop_base_mask_prob=morehop_base_mask_prob,
         )
     else:
         train_masker = None
@@ -614,6 +605,7 @@ def main() -> None:
             eval_ratio=args.eval_ratio,
             seed=args.seed,
             morehop_target_span_mask_prob=args.morehop_target_span_mask_prob,
+            morehop_base_mask_prob=args.morehop_base_mask_prob,
         )
 
         training_args = build_training_arguments(args, stage_output_dir, device)
