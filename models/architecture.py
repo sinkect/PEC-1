@@ -510,11 +510,20 @@ class PECEngine(nn.Module):
             profiler_attention_mask=profiler_attention_mask,
         )
         z_pool = artifacts["extruder_latents"].mean(dim=1)  # [B, Dprof]
+        previous_memory = None
+        should_restore_memory = True
+        if self._composer_memory_holder is not None:
+            previous_memory = getattr(self._composer_memory_holder, "memory_kv", None)
+            self._composer_memory_holder.memory_kv = {
+                "memory_keys": artifacts["memory_keys"],
+                "memory_values": artifacts["memory_values"],
+            }
+            # Transformer layer checkpointing recomputes attention blocks during backward.
+            # Keep the memory KV mounted until the next forward so recomputation sees the
+            # same patched attention path instead of falling back to the original one.
+            should_restore_memory = not (self.training and self.is_gradient_checkpointing)
 
-        with self.composer_memory_context(
-            memory_keys=artifacts["memory_keys"],
-            memory_values=artifacts["memory_values"],
-        ):
+        try:
             outputs = self.composer(
                 input_ids=composer_input_ids,
                 attention_mask=composer_attention_mask,
@@ -522,6 +531,13 @@ class PECEngine(nn.Module):
                 use_cache=False,
                 return_dict=True,
             )
+        except Exception:
+            if self._composer_memory_holder is not None:
+                self._composer_memory_holder.memory_kv = previous_memory
+            raise
+        else:
+            if self._composer_memory_holder is not None and should_restore_memory:
+                self._composer_memory_holder.memory_kv = previous_memory
 
         answer_loss = outputs.loss
         mh_align_loss = self._compute_morehop_align_loss(
