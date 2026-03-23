@@ -24,6 +24,7 @@ from models.architecture import PECEngine
 from models.data import PECDataset, PECCollator, EntityMasker, SharedMaskProbability
 from models.dataset_mixing import (
     BlendResult,
+    build_morehop_prompt,
     load_stage1_blended_dataset,
     save_blend_metadata,
     save_sampled_by_source_as_jsonl,
@@ -308,6 +309,51 @@ FIXED_SAMPLE_PROMPTS = [
             "overlook the entire pond, is enshrined Amaterasu, which is said to have been brought from Ise "
             "Shrine, the highest rank shrine in the country, as a guardian deity for the pond.\n"
             "|address||Yagisawa, Ueda City|"
+        ),
+    },
+    {
+        "name": "morehop_reverse_seldom",
+        "prompt": build_morehop_prompt(
+            {
+                "question": (
+                    "What is the reverse order of the letters in the first name of the role the actor who "
+                    "played Colonel Sherman T. Potter in \"M*A*S*H\" played in \"Kentucky Jones\"?"
+                ),
+                "context": [
+                    [
+                        "Kentucky Jones",
+                        [
+                            "Kentucky Jones is a half-hour comedy/drama starring Dennis Weaver as Kenneth "
+                            "Yarborough \"K.Y. or Kentucky\" Jones, D.V.M., a recently widowed former horse "
+                            "trainer and active horse farm owner, who becomes the guardian of Dwight Eisenhower "
+                            "\"Ike\" Wong, a 10-year-old Chinese orphan, played by Ricky Der.",
+                            "Harry Morgan, previously of the CBS sitcoms \"December Bride\" and \"Pete and "
+                            "Gladys\", was featured in the series as Seldom Jackson, a former jockey who assists "
+                            "Dr. Jones.",
+                            "Cherylene Lee appears as Annie Ng, Ike's friend.",
+                            "Arthur Wong portrays Mr. Ng, Annie's father.",
+                            "Keye Luke (1904-1991) stars as Mr. Wong, a friend of Dr. Jones.",
+                            "Nancy Rennick (1932-2006) appears as Miss Throncroft, a social worker.",
+                            "\"Kentucky Jones\", which ran on NBC from September 19, 1964, to September 11, 1965, "
+                            "was the first of four television series starring Weaver after he left the role of the "
+                            "marshall's helper Chester Goode on CBS's western classic \"Gunsmoke\".",
+                        ],
+                    ],
+                    [
+                        "Harry Morgan",
+                        [
+                            "Harry Morgan (born Harry Bratsberg, April 10, 1915 - December 7, 2011) was an "
+                            "American actor and director whose television and film career spanned six decades.",
+                            "Morgan's major roles included Pete Porter in both \"December Bride\" (1954-1959) "
+                            "and \"Pete and Gladys\" (1960-1962); Officer Bill Gannon on \"Dragnet\" "
+                            "(1967-1970); Amos Coogan on \"Hec Ramsey\" (1972-1974); and his starring role as "
+                            "Colonel Sherman T. Potter in \"M*A*S*H\" (1975-1983) and \"AfterMASH\" "
+                            "(1983-1984).",
+                            "Morgan appeared in more than 100 films.",
+                        ],
+                    ],
+                ],
+            }
         ),
     },
 ]
