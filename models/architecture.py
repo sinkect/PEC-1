@@ -325,8 +325,8 @@ class PECEngine(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-        nn.init.xavier_uniform_(self.k_mem_proj.weight)
-        nn.init.xavier_uniform_(self.v_mem_proj.weight)
+        nn.init.xavier_uniform_(self.k_mem_proj[0].weight)
+        nn.init.xavier_uniform_(self.v_mem_proj[0].weight)
         nn.init.ones_(self.post_extruder_norm.weight)
 
     @property
@@ -383,7 +383,7 @@ class PECEngine(nn.Module):
         )  # [B, M, Dprof]
 
         projected_input = self.post_extruder_norm(extruder_latents)  # [B, M, Dprof]
-        memory_dtype = self.k_mem_proj.weight.dtype
+        memory_dtype = self.k_mem_proj[0].weight.dtype
         batch_size, num_slots, _ = projected_input.shape
         memory_keys = self.k_mem_proj(projected_input.to(dtype=memory_dtype))  # [B, M, Hkv * Dh]
         memory_values = self.v_mem_proj(projected_input.to(dtype=memory_dtype))  # [B, M, Hkv * Dh]

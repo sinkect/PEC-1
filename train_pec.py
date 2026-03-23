@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         "--stage23-mask-prob-start",
         dest="stage1_mask_prob_start",
         type=float,
-        default=0.7,
+        default=0.5,
     )
     parser.add_argument(
         "--stage1-mask-prob-end",
@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--per-device-train-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=5e-4)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument(
         "--extruder-learning-rate",
         type=float,
