@@ -150,6 +150,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-profiler-len", type=int, default=6144)
     parser.add_argument("--max-composer-len", type=int, default=6144)
+    parser.add_argument(
+        "--sample-generation-max-new-tokens",
+        type=int,
+        default=128,
+        help="Maximum number of new tokens for fixed sample generation during training.",
+    )
     return parser.parse_args()
 
 
@@ -840,7 +846,7 @@ def main() -> None:
                 max_profiler_len=args.max_profiler_len,
                 max_composer_len=args.max_composer_len,
                 every_steps=500,
-                max_new_tokens=128,
+                max_new_tokens=args.sample_generation_max_new_tokens,
             )
         )
 
