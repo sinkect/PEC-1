@@ -14,9 +14,11 @@ from torch.utils.data import ConcatDataset, Dataset, Subset
 
 try:
     from datasets import Dataset as HFDataset
+    from datasets import concatenate_datasets
     from datasets import load_dataset
 except ModuleNotFoundError:  # Optional for lightweight utility imports/tests.
     HFDataset = Any
+    concatenate_datasets = None
     load_dataset = None
 
 try:
@@ -895,6 +897,31 @@ def _load_morehopqa_dataset(split: str = "train", include_unverified: bool = Tru
     if load_dataset is None:
         raise ModuleNotFoundError("The 'datasets' package is required to load MoreHopQA.")
 
+    def load_morehopqa_json_source(data_file: str) -> HFDataset:
+        dataset = load_dataset("json", data_files={split: data_file}, split=split)
+        normalized_rows = []
+        for index in range(len(dataset)):
+            sample = dataset[index]
+            normalized_rows.append(
+                {
+                    "question": sample.get("question"),
+                    "answer": sample.get("answer"),
+                    "question_decomposition": sample.get("question_decomposition"),
+                    "context": sample.get("context"),
+                    "paragraphs": sample.get("paragraphs"),
+                }
+            )
+        return HFDataset.from_list(normalized_rows)
+
+    def combine_morehopqa_datasets(datasets: List[HFDataset]) -> HFDataset:
+        if not datasets:
+            raise ValueError("No MoreHopQA datasets were loaded.")
+        if len(datasets) == 1:
+            return datasets[0]
+        if concatenate_datasets is None:
+            raise ModuleNotFoundError("The 'datasets' package is required to concatenate MoreHopQA datasets.")
+        return concatenate_datasets(datasets)
+
     if snapshot_download is not None:
         try:
             snapshot_dir = snapshot_download(
@@ -909,13 +936,13 @@ def _load_morehopqa_dataset(split: str = "train", include_unverified: bool = Tru
             snapshot_path = Path(snapshot_dir)
             verified_json_path = snapshot_path / "data" / "with_human_verification.json"
             unverified_json_path = snapshot_path / "data" / "without_human_verification.json"
-            json_paths: List[str] = []
+            datasets: List[HFDataset] = []
             if verified_json_path.exists():
-                json_paths.append(str(verified_json_path))
+                datasets.append(load_morehopqa_json_source(str(verified_json_path)))
             if include_unverified and unverified_json_path.exists():
-                json_paths.append(str(unverified_json_path))
-            if json_paths and (not include_unverified or unverified_json_path.exists()):
-                return load_dataset("json", data_files={split: json_paths}, split=split)
+                datasets.append(load_morehopqa_json_source(str(unverified_json_path)))
+            if datasets:
+                return combine_morehopqa_datasets(datasets)
 
             parquet_files = sorted((snapshot_path / "verified").glob("*.parquet"))
             if parquet_files and not include_unverified:
@@ -926,7 +953,7 @@ def _load_morehopqa_dataset(split: str = "train", include_unverified: bool = Tru
     json_urls = [MOREHOPQA_HUMAN_VERIFIED_JSON_URL]
     if include_unverified:
         json_urls.append(MOREHOPQA_UNVERIFIED_JSON_URL)
-    return load_dataset("json", data_files={split: json_urls}, split=split)
+    return combine_morehopqa_datasets([load_morehopqa_json_source(json_url) for json_url in json_urls])
 
 
 def _load_harp_dataset() -> HFDataset:
