@@ -455,12 +455,29 @@ class PECCollator:
         input_ids = composer_inputs["input_ids"]
         attention_mask = composer_inputs["attention_mask"]
         labels = input_ids.clone()
+        prompt_inputs = self.composer_tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_composer_len,
+        )
+        prompt_attention_mask = prompt_inputs.get("attention_mask")
 
         for index, prompt in enumerate(prompt_texts):
-            prompt_tokens = self.composer_tokenizer(prompt, add_special_tokens=False)["input_ids"]
-            prompt_len = len(prompt_tokens)
-            if prompt_len < labels.shape[1]:
-                labels[index, :prompt_len] = -100
+            del prompt
+            if prompt_attention_mask is not None:
+                prompt_len = int(prompt_attention_mask[index].sum().item())
+            else:
+                prompt_tokens = self.composer_tokenizer(
+                    prompt_texts[index],
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=self.max_composer_len,
+                )["input_ids"]
+                prompt_len = len(prompt_tokens)
+            prompt_len = min(prompt_len, labels.shape[1])
+            labels[index, :prompt_len] = -100
 
         labels[input_ids == self.composer_tokenizer.pad_token_id] = -100
         return {
