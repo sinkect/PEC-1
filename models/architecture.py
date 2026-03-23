@@ -557,6 +557,18 @@ class PECEngine(nn.Module):
             "logits": outputs.logits if return_logits else None,
         }
 
+    @staticmethod
+    def _morehop_alignment_weight_schedule(num_targets: int) -> list[float]:
+        if num_targets <= 0:
+            return []
+        if num_targets == 1:
+            return [1.0]
+        if num_targets == 2:
+            return [0.3, 1.0]
+        if num_targets == 3:
+            return [0.2, 0.5, 1.0]
+        return torch.linspace(0.2, 1.0, steps=num_targets, dtype=torch.float32).tolist()
+
     def _compute_morehop_align_loss(
         self,
         *,
@@ -568,13 +580,18 @@ class PECEngine(nn.Module):
             return None
 
         total_loss = z_pool.new_zeros(())
-        total_pairs = 0
+        total_weight = z_pool.new_zeros(())
+        active_rows_per_target = [
+            torch.any(target_attention_mask.bool(), dim=1).to(device=z_pool.device)
+            for target_attention_mask in mh_target_attention_mask_list
+        ]
+        targets_per_row = torch.stack(active_rows_per_target, dim=0).sum(dim=0)
 
-        for target_input_ids, target_attention_mask in zip(
+        for target_index, (target_input_ids, target_attention_mask, active_rows) in enumerate(zip(
             mh_target_input_ids_list,
             mh_target_attention_mask_list,
-        ):
-            active_rows = torch.any(target_attention_mask.bool(), dim=1)
+            active_rows_per_target,
+        )):
             if not torch.any(active_rows):
                 continue
 
@@ -593,10 +610,16 @@ class PECEngine(nn.Module):
                 r_k[active_rows].float(),
                 dim=-1,
             )
-            total_loss = total_loss + (1.0 - similarities).sum()
-            total_pairs += int(active_rows.sum().item())
+            target_weights = similarities.new_tensor(
+                [
+                    self._morehop_alignment_weight_schedule(int(target_count))[target_index]
+                    for target_count in targets_per_row[active_rows].tolist()
+                ]
+            )
+            total_loss = total_loss + (((1.0 - similarities) * target_weights).sum()).to(dtype=total_loss.dtype)
+            total_weight = total_weight + target_weights.sum().to(dtype=total_weight.dtype)
 
-        if total_pairs == 0:
+        if not bool(total_weight > 0):
             return None
 
-        return total_loss / total_pairs
+        return total_loss / total_weight
