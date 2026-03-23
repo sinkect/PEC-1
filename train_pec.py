@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -367,8 +366,6 @@ class FixedSampleGenerationCallback(TrainerCallback):
             stage_output_dir: Path,
             profiler_tokenizer,
             composer_tokenizer,
-            visible_prompt_mode: str,
-            query_masker,
             max_profiler_len: int,
             max_composer_len: int,
             every_steps: int = 500,
@@ -378,8 +375,6 @@ class FixedSampleGenerationCallback(TrainerCallback):
         self.stage_output_dir = stage_output_dir
         self.profiler_tokenizer = profiler_tokenizer
         self.composer_tokenizer = composer_tokenizer
-        self.visible_prompt_mode = visible_prompt_mode
-        self.query_masker = query_masker
         self.max_profiler_len = max_profiler_len
         self.max_composer_len = max_composer_len
         self.every_steps = int(every_steps)
@@ -387,20 +382,7 @@ class FixedSampleGenerationCallback(TrainerCallback):
         self.output_path = self.stage_output_dir / "sample_generations.jsonl"
 
     def _build_visible_prompt(self, prompt: str) -> str:
-        if self.visible_prompt_mode == "full":
-            return prompt
-        if self.visible_prompt_mode == "empty":
-            return ""
-        if self.visible_prompt_mode == "masked":
-            if self.query_masker is None:
-                raise ValueError("query_masker is required for masked sample generation.")
-            previous_random_state = random.getstate()
-            random.seed(0)
-            try:
-                return self.query_masker(prompt)
-            finally:
-                random.setstate(previous_random_state)
-        raise ValueError(f"Unsupported visible_prompt_mode: {self.visible_prompt_mode}")
+        return prompt
 
     def _build_composer_prompt_text(self, visible_prompt: str) -> str:
         return self.composer_tokenizer.apply_chat_template(
@@ -855,8 +837,6 @@ def main() -> None:
                 stage_output_dir=stage_output_dir,
                 profiler_tokenizer=profiler_tokenizer,
                 composer_tokenizer=composer_tokenizer,
-                visible_prompt_mode=stage.visible_prompt_mode,
-                query_masker=train_dataset.query_masker,
                 max_profiler_len=args.max_profiler_len,
                 max_composer_len=args.max_composer_len,
                 every_steps=500,
