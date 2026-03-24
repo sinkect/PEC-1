@@ -141,7 +141,7 @@ def parse_args() -> argparse.Namespace:
         "--morehop-align-mode",
         type=str,
         choices=["weighted", "last"],
-        default="weighted",
+        default="last",
         help="How to aggregate MoreHopQA grounded-answer alignment targets.",
     )
     parser.add_argument(
@@ -173,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sample-generation-max-new-tokens",
         type=int,
-        default=128,
+        default=1024,
         help="Maximum number of new tokens for fixed sample generation during training.",
     )
     return parser.parse_args()
