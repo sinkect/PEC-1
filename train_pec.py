@@ -82,7 +82,8 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
     )
     parser.add_argument("--process-name", type=str, default="pec_training")
-    parser.add_argument("--num-query-tokens", type=int, default=16, help="Number of latent memory slots.")
+    parser.add_argument("--num-query-tokens", type=int, default=64, help="Number of extruder latent tokens.")
+    parser.add_argument("--num-memory-slots", type=int, default=16, help="Number of projected KV memory slots.")
     parser.add_argument("--memory-upper-layers", type=int, default=8)
     parser.add_argument(
         "--freeze-profiler",
@@ -627,9 +628,25 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
     projector_params = [
         parameter
         for name, parameter in named_parameters
-        if name.startswith("k_mem_proj.") or name.startswith("v_mem_proj.")
+        if (
+            name.startswith("k_slot_proj.")
+            or name.startswith("v_slot_proj.")
+            or name.startswith("k_mem_proj.")
+            or name.startswith("v_mem_proj.")
+            or name.startswith("k_mem_out_proj.")
+            or name.startswith("v_mem_out_proj.")
+        )
     ]
-    covered_prefixes = ("profiler.", "extruder.", "k_mem_proj.", "v_mem_proj.")
+    covered_prefixes = (
+        "profiler.",
+        "extruder.",
+        "k_slot_proj.",
+        "v_slot_proj.",
+        "k_mem_proj.",
+        "v_mem_proj.",
+        "k_mem_out_proj.",
+        "v_mem_out_proj.",
+    )
     misc_params = [
         parameter
         for name, parameter in named_parameters
@@ -802,6 +819,7 @@ def main() -> None:
         profiler_path=str(args.profiler_model_path),
         composer_path=args.composer_model_name,
         num_query_tokens=args.num_query_tokens,
+        num_memory_slots=args.num_memory_slots,
         morehop_align_lambda=args.morehop_align_lambda,
         morehop_align_mode=args.morehop_align_mode,
         freeze_profiler=args.freeze_profiler,

@@ -196,7 +196,8 @@ class PECEngine(nn.Module):
         self,
         profiler_path="answerdotai/ModernBERT-base",
         composer_path="Qwen/Qwen3-1.7B",
-        num_query_tokens=16,
+        num_query_tokens=64,
+        num_memory_slots: int | None = None,
         morehop_align_lambda: float = 0.1,
         morehop_align_mode: str = "weighted",
         freeze_profiler=False,
@@ -227,6 +228,7 @@ class PECEngine(nn.Module):
         self.prof_dim = self.profiler.config.hidden_size
         self.comp_dim = self.composer.config.hidden_size
         self.num_query_tokens = int(num_query_tokens)
+        self.num_memory_slots = int(num_memory_slots) if num_memory_slots is not None else self.num_query_tokens
         self.morehop_align_lambda = float(morehop_align_lambda)
         if morehop_align_mode not in {"weighted", "last"}:
             raise ValueError(f"Unsupported MoreHopQA align mode: {morehop_align_mode}")
@@ -249,13 +251,23 @@ class PECEngine(nn.Module):
         self.memory_num_key_value_heads, self.memory_head_dim = self._resolve_memory_projection_shape()
         memory_proj_dtype = self._composer_parameter_dtype()
         memory_proj_dim = self.memory_num_key_value_heads * self.memory_head_dim
+        self.k_slot_proj = nn.Linear(self.num_query_tokens, self.num_memory_slots, bias=False).to(dtype=memory_proj_dtype)
+        self.v_slot_proj = nn.Linear(self.num_query_tokens, self.num_memory_slots, bias=False).to(dtype=memory_proj_dtype)
 
         self.k_mem_proj = nn.Sequential(
-            nn.Linear(self.prof_dim, memory_proj_dim, bias=False),
-            nn.RMSNorm(memory_proj_dim),
+            nn.Linear(self.prof_dim, self.comp_dim, bias=False),
+            nn.RMSNorm(self.comp_dim),
         ).to(dtype=memory_proj_dtype)
         self.v_mem_proj = nn.Sequential(
-            nn.Linear(self.prof_dim, memory_proj_dim, bias=False),
+            nn.Linear(self.prof_dim, self.comp_dim, bias=False),
+            nn.RMSNorm(self.comp_dim),
+        ).to(dtype=memory_proj_dtype)
+        self.k_mem_out_proj = nn.Sequential(
+            nn.Linear(self.comp_dim, memory_proj_dim, bias=False),
+            nn.RMSNorm(memory_proj_dim),
+        ).to(dtype=memory_proj_dtype)
+        self.v_mem_out_proj = nn.Sequential(
+            nn.Linear(self.comp_dim, memory_proj_dim, bias=False),
             nn.RMSNorm(memory_proj_dim),
         ).to(dtype=memory_proj_dtype)
 
@@ -329,8 +341,12 @@ class PECEngine(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+        nn.init.xavier_uniform_(self.k_slot_proj.weight)
+        nn.init.xavier_uniform_(self.v_slot_proj.weight)
         nn.init.xavier_uniform_(self.k_mem_proj[0].weight)
         nn.init.xavier_uniform_(self.v_mem_proj[0].weight)
+        nn.init.xavier_uniform_(self.k_mem_out_proj[0].weight)
+        nn.init.xavier_uniform_(self.v_mem_out_proj[0].weight)
         nn.init.ones_(self.post_extruder_norm.weight)
 
     @property
@@ -384,13 +400,17 @@ class PECEngine(nn.Module):
         extruder_latents = self.extruder(
             context=prof_hidden,
             attn_mask=profiler_attention_mask,
-        )  # [B, M, Dprof]
+        )  # [B, Nq, Dprof]
 
-        projected_input = self.post_extruder_norm(extruder_latents)  # [B, M, Dprof]
+        projected_input = self.post_extruder_norm(extruder_latents)  # [B, Nq, Dprof]
         memory_dtype = self.k_mem_proj[0].weight.dtype
-        batch_size, num_slots, _ = projected_input.shape
-        memory_keys = self.k_mem_proj(projected_input.to(dtype=memory_dtype))  # [B, M, Hkv * Dh]
-        memory_values = self.v_mem_proj(projected_input.to(dtype=memory_dtype))  # [B, M, Hkv * Dh]
+        k_comp_input = self.k_mem_proj(projected_input.to(dtype=memory_dtype))  # [B, Nq, Dcomp]
+        v_comp_input = self.v_mem_proj(projected_input.to(dtype=memory_dtype))  # [B, Nq, Dcomp]
+        k_slot_input = self.k_slot_proj(k_comp_input.transpose(1, 2)).transpose(1, 2).contiguous()  # [B, M, Dcomp]
+        v_slot_input = self.v_slot_proj(v_comp_input.transpose(1, 2)).transpose(1, 2).contiguous()  # [B, M, Dcomp]
+        batch_size, num_slots, _ = k_slot_input.shape
+        memory_keys = self.k_mem_out_proj(k_slot_input)  # [B, M, Hkv * Dh]
+        memory_values = self.v_mem_out_proj(v_slot_input)  # [B, M, Hkv * Dh]
 
         memory_keys = memory_keys.view(batch_size, num_slots, self.memory_num_key_value_heads, self.memory_head_dim)
         memory_values = memory_values.view(batch_size, num_slots, self.memory_num_key_value_heads, self.memory_head_dim)
@@ -400,6 +420,10 @@ class PECEngine(nn.Module):
         return {
             "extruder_latents": extruder_latents,
             "projected_input": projected_input,
+            "k_comp_input": k_comp_input,
+            "v_comp_input": v_comp_input,
+            "k_slot_input": k_slot_input,
+            "v_slot_input": v_slot_input,
             "memory_keys": memory_keys,
             "memory_values": memory_values,
             "profiler_hidden": prof_hidden,

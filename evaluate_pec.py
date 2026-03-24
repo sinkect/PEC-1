@@ -415,7 +415,8 @@ def generate_pec_responses(
                 **summarize_tensor(z_sample, prefix="latent_z"),
                 **summarize_tensor(k_sample, prefix="memory_k"),
                 **summarize_tensor(v_sample, prefix="memory_v"),
-                "memory_slots": int(z_sample.shape[0]),
+                "latent_tokens": int(z_sample.shape[0]),
+                "memory_slots": int(k_sample.shape[1]),
                 "memory_key_slice": k_head,
                 "memory_value_slice": v_head,
             }
@@ -534,12 +535,37 @@ def load_base_model(model_name: str, device: torch.device, dtype: torch.dtype):
     return model, tokenizer
 
 
+def infer_num_query_tokens_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> int | None:
+    query_tokens = state_dict.get("extruder.query_tokens")
+    if isinstance(query_tokens, torch.Tensor) and query_tokens.ndim == 3:
+        return int(query_tokens.shape[1])
+
+    gate_bias = state_dict.get("extruder.gate_mlp.2.bias")
+    if isinstance(gate_bias, torch.Tensor) and gate_bias.ndim == 1:
+        return int(gate_bias.shape[0])
+
+    delta_bias = state_dict.get("extruder.delta_mlp.2.bias")
+    if isinstance(delta_bias, torch.Tensor) and delta_bias.ndim == 1:
+        hidden_size = state_dict.get("extruder.query_tokens")
+        if isinstance(hidden_size, torch.Tensor) and hidden_size.ndim == 3 and hidden_size.shape[-1] > 0:
+            return int(delta_bias.shape[0] // hidden_size.shape[-1])
+    return None
+
+
+def infer_num_memory_slots_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> int | None:
+    k_slot_proj = state_dict.get("k_slot_proj.weight")
+    if isinstance(k_slot_proj, torch.Tensor) and k_slot_proj.ndim == 2:
+        return int(k_slot_proj.shape[0])
+    return None
+
+
 def load_pec_model(
     *,
     checkpoint_dir: Path,
     profiler_path: str | Path,
     composer_model_name: str,
     num_query_tokens: int,
+    num_memory_slots: int,
     device: torch.device,
 ):
     profiler_tokenizer = AutoTokenizer.from_pretrained(profiler_path)
@@ -547,12 +573,32 @@ def load_pec_model(
     composer_tokenizer = AutoTokenizer.from_pretrained(composer_model_name)
     prepare_generation_tokenizer(composer_tokenizer)
 
+    state_dict = load_state_dict_from_checkpoint(checkpoint_dir)
+    checkpoint_num_query_tokens = infer_num_query_tokens_from_state_dict(state_dict)
+    resolved_num_query_tokens = int(num_query_tokens)
+    if checkpoint_num_query_tokens is not None and checkpoint_num_query_tokens != resolved_num_query_tokens:
+        print(
+            f"[PEC] Overriding num_query_tokens={resolved_num_query_tokens} with checkpoint value "
+            f"{checkpoint_num_query_tokens}.",
+            flush=True,
+        )
+        resolved_num_query_tokens = checkpoint_num_query_tokens
+    checkpoint_num_memory_slots = infer_num_memory_slots_from_state_dict(state_dict)
+    resolved_num_memory_slots = int(num_memory_slots)
+    if checkpoint_num_memory_slots is not None and checkpoint_num_memory_slots != resolved_num_memory_slots:
+        print(
+            f"[PEC] Overriding num_memory_slots={resolved_num_memory_slots} with checkpoint value "
+            f"{checkpoint_num_memory_slots}.",
+            flush=True,
+        )
+        resolved_num_memory_slots = checkpoint_num_memory_slots
+
     model = PECEngine(
         profiler_path=str(profiler_path),
         composer_path=composer_model_name,
-        num_query_tokens=num_query_tokens,
+        num_query_tokens=resolved_num_query_tokens,
+        num_memory_slots=resolved_num_memory_slots,
     )
-    state_dict = load_state_dict_from_checkpoint(checkpoint_dir)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     filtered_unexpected_keys = [
         key for key in unexpected_keys
@@ -569,7 +615,18 @@ def load_pec_model(
     dynamic_query_prefixes = ("extruder.delta_mlp", "extruder.gate_mlp")
     critical_missing = [
         key for key in missing_keys
-        if key.startswith(("extruder", "post_extruder_norm"))
+        if key.startswith(
+            (
+                "extruder",
+                "post_extruder_norm",
+                "k_slot_proj",
+                "v_slot_proj",
+                "k_mem_proj",
+                "v_mem_proj",
+                "k_mem_out_proj",
+                "v_mem_out_proj",
+            )
+        )
         and not key.startswith(dynamic_query_prefixes)
     ]
     if critical_missing:
@@ -785,6 +842,7 @@ def evaluate_pec_re2_benchmark(
     profiler_path: str | Path,
     composer_model_name: str,
     num_query_tokens: int,
+    num_memory_slots: int,
     max_profiler_len: int,
     max_composer_len: int,
     batch_size: int,
@@ -804,6 +862,7 @@ def evaluate_pec_re2_benchmark(
         profiler_path=profiler_path,
         composer_model_name=composer_model_name,
         num_query_tokens=num_query_tokens,
+        num_memory_slots=num_memory_slots,
         device=device,
     )
     predictions: List[Dict[str, Any]] = []
@@ -995,6 +1054,8 @@ def build_re2_worker_command(
         args.pec_composer_model,
         "--num-query-tokens",
         str(args.num_query_tokens),
+        "--num-memory-slots",
+        str(args.num_memory_slots),
         "--max-profiler-len",
         str(args.max_profiler_len),
         "--max-composer-len",
@@ -1204,6 +1265,7 @@ def run_re2_paper_protocol(args: argparse.Namespace) -> None:
         "num_eval_jobs": len(jobs),
         "pec_composer_model": args.pec_composer_model,
         "num_query_tokens": args.num_query_tokens,
+        "num_memory_slots": args.num_memory_slots,
         "max_new_tokens": args.max_new_tokens,
         "do_sample": bool(args.do_sample),
         "enable_thinking": bool(args.enable_thinking),
@@ -1265,6 +1327,7 @@ def run_re2_paper_protocol(args: argparse.Namespace) -> None:
                     profiler_path=args.profiler_path,
                     composer_model_name=args.pec_composer_model,
                     num_query_tokens=args.num_query_tokens,
+                    num_memory_slots=args.num_memory_slots,
                     max_profiler_len=args.max_profiler_len,
                     max_composer_len=args.max_composer_len,
                     batch_size=args.batch_size,
@@ -1411,6 +1474,7 @@ def evaluate_pec_experiment(
     profiler_path: str | Path,
     composer_model_name: str,
     num_query_tokens: int,
+    num_memory_slots: int,
     mask_probability: float,
     mask_seed: int,
     max_profiler_len: int,
@@ -1433,6 +1497,7 @@ def evaluate_pec_experiment(
         profiler_path=profiler_path,
         composer_model_name=composer_model_name,
         num_query_tokens=num_query_tokens,
+        num_memory_slots=num_memory_slots,
         device=device,
     )
 
@@ -1491,7 +1556,8 @@ def evaluate_pec_experiment(
                     "model_name": composer_model_name,
                     "prompt_mode": "masked_30" if masker is not None else "full",
                     "soft_prompt_first": True,
-                    "soft_prompt_tokens": num_query_tokens,
+                    "soft_prompt_tokens": num_memory_slots,
+                    "latent_query_tokens": num_query_tokens,
                     "profiler_prompt": sample["prompt"],
                     "composer_visible_prompt": visible_prompt,
                     "reference": sample["answer"],
@@ -1625,6 +1691,7 @@ def run_eval_job(
         profiler_path=args.profiler_path,
         composer_model_name=job["model_name"],
         num_query_tokens=args.num_query_tokens,
+        num_memory_slots=args.num_memory_slots,
         mask_probability=args.mask_probability,
         mask_seed=args.mask_seed,
         max_profiler_len=args.max_profiler_len,
@@ -1696,6 +1763,8 @@ def build_worker_command(
         args.pec_composer_model,
         "--num-query-tokens",
         str(args.num_query_tokens),
+        "--num-memory-slots",
+        str(args.num_memory_slots),
         "--mask-probability",
         str(args.mask_probability),
         "--mask-seed",
@@ -1929,6 +1998,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profiler-path", type=str, default="answerdotai/ModernBERT-base")
     parser.add_argument("--pec-composer-model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--num-query-tokens", type=int, default=64)
+    parser.add_argument("--num-memory-slots", type=int, default=16)
     parser.add_argument("--mask-probability", type=float, default=0.3)
     parser.add_argument("--mask-seed", type=int, default=42)
     parser.add_argument("--max-profiler-len", type=int, default=6144)
@@ -2048,6 +2118,7 @@ def main() -> None:
                     profiler_path=args.profiler_path,
                     composer_model_name=args.pec_composer_model,
                     num_query_tokens=args.num_query_tokens,
+                    num_memory_slots=args.num_memory_slots,
                     max_profiler_len=args.max_profiler_len,
                     max_composer_len=args.max_composer_len,
                     batch_size=args.batch_size,
@@ -2137,7 +2208,8 @@ def main() -> None:
         "base_models": args.base_models,
         "base_prompt_scenarios": args.base_scenarios,
         "pec_composer_model": args.pec_composer_model,
-        "soft_prompt_tokens": args.num_query_tokens,
+        "soft_prompt_tokens": args.num_memory_slots,
+        "latent_query_tokens": args.num_query_tokens,
         "batch_size": args.batch_size,
         "preview_samples": args.preview_samples,
         "gpu_ids": gpu_ids,
