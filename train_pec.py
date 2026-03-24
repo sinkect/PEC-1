@@ -629,10 +629,8 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
         parameter
         for name, parameter in named_parameters
         if (
-            name.startswith("k_slot_proj.")
-            or name.startswith("v_slot_proj.")
-            or name.startswith("k_mem_proj.")
-            or name.startswith("v_mem_proj.")
+            name.startswith("slot_proj.")
+            or name.startswith("mem_proj.")
             or name.startswith("k_mem_out_proj.")
             or name.startswith("v_mem_out_proj.")
         )
@@ -640,10 +638,8 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
     covered_prefixes = (
         "profiler.",
         "extruder.",
-        "k_slot_proj.",
-        "v_slot_proj.",
-        "k_mem_proj.",
-        "v_mem_proj.",
+        "slot_proj.",
+        "mem_proj.",
         "k_mem_out_proj.",
         "v_mem_out_proj.",
     )
@@ -716,8 +712,10 @@ def initialize_model_from_checkpoint(model: PECEngine, checkpoint_dir: Path) -> 
         if not (
             key.startswith("composer.")
             or key.startswith("profiler.")
-            or key.startswith("k_mem_proj.")
-            or key.startswith("v_mem_proj.")
+            or key.startswith("mem_proj.")
+            or key.startswith("slot_proj.")
+            or key.startswith("k_mem_out_proj.")
+            or key.startswith("v_mem_out_proj.")
         )
     ]
     if critical_missing:

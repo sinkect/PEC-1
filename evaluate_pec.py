@@ -640,9 +640,9 @@ def infer_num_query_tokens_from_state_dict(state_dict: Dict[str, torch.Tensor]) 
 
 
 def infer_num_memory_slots_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> int | None:
-    k_slot_proj = state_dict.get("k_slot_proj.weight")
-    if isinstance(k_slot_proj, torch.Tensor) and k_slot_proj.ndim == 2:
-        return int(k_slot_proj.shape[0])
+    slot_proj = state_dict.get("slot_proj.weight")
+    if isinstance(slot_proj, torch.Tensor) and slot_proj.ndim == 2:
+        return int(slot_proj.shape[0])
     return None
 
 
@@ -706,10 +706,8 @@ def load_pec_model(
             (
                 "extruder",
                 "post_extruder_norm",
-                "k_slot_proj",
-                "v_slot_proj",
-                "k_mem_proj",
-                "v_mem_proj",
+                "slot_proj",
+                "mem_proj",
                 "k_mem_out_proj",
                 "v_mem_out_proj",
             )

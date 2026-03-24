@@ -302,17 +302,11 @@ class PECEngine(nn.Module):
         self.memory_num_key_value_heads, self.memory_head_dim = self._resolve_memory_projection_shape()
         memory_proj_dtype = self._composer_parameter_dtype()
         memory_proj_dim = self.memory_num_key_value_heads * self.memory_head_dim
-        self.k_slot_proj = nn.Linear(self.num_query_tokens, self.num_memory_slots, bias=False).to(dtype=memory_proj_dtype)
-        self.v_slot_proj = nn.Linear(self.num_query_tokens, self.num_memory_slots, bias=False).to(dtype=memory_proj_dtype)
-
-        self.k_mem_proj = nn.Sequential(
+        self.mem_proj = nn.Sequential(
             nn.Linear(self.prof_dim, self.comp_dim, bias=False),
             nn.RMSNorm(self.comp_dim),
         ).to(dtype=memory_proj_dtype)
-        self.v_mem_proj = nn.Sequential(
-            nn.Linear(self.prof_dim, self.comp_dim, bias=False),
-            nn.RMSNorm(self.comp_dim),
-        ).to(dtype=memory_proj_dtype)
+        self.slot_proj = nn.Linear(self.num_query_tokens, self.num_memory_slots, bias=False).to(dtype=memory_proj_dtype)
         self.k_mem_out_proj = nn.Sequential(
             nn.Linear(self.comp_dim, memory_proj_dim, bias=False),
             nn.RMSNorm(memory_proj_dim),
@@ -392,10 +386,8 @@ class PECEngine(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-        nn.init.xavier_uniform_(self.k_slot_proj.weight)
-        nn.init.xavier_uniform_(self.v_slot_proj.weight)
-        nn.init.xavier_uniform_(self.k_mem_proj[0].weight)
-        nn.init.xavier_uniform_(self.v_mem_proj[0].weight)
+        nn.init.xavier_uniform_(self.slot_proj.weight)
+        nn.init.xavier_uniform_(self.mem_proj[0].weight)
         nn.init.xavier_uniform_(self.k_mem_out_proj[0].weight)
         nn.init.xavier_uniform_(self.v_mem_out_proj[0].weight)
         nn.init.ones_(self.post_extruder_norm.weight)
@@ -454,14 +446,14 @@ class PECEngine(nn.Module):
         )  # [B, Nq, Dprof]
 
         projected_input = self.post_extruder_norm(extruder_latents)  # [B, Nq, Dprof]
-        memory_dtype = self.k_mem_proj[0].weight.dtype
-        k_comp_input = self.k_mem_proj(projected_input.to(dtype=memory_dtype))  # [B, Nq, Dcomp]
-        v_comp_input = self.v_mem_proj(projected_input.to(dtype=memory_dtype))  # [B, Nq, Dcomp]
-        k_slot_input = self.k_slot_proj(k_comp_input.transpose(1, 2)).transpose(1, 2).contiguous()  # [B, M, Dcomp]
-        v_slot_input = self.v_slot_proj(v_comp_input.transpose(1, 2)).transpose(1, 2).contiguous()  # [B, M, Dcomp]
-        batch_size, num_slots, _ = k_slot_input.shape
-        memory_keys = self.k_mem_out_proj(k_slot_input)  # [B, M, Hkv * Dh]
-        memory_values = self.v_mem_out_proj(v_slot_input)  # [B, M, Hkv * Dh]
+        memory_dtype = self.mem_proj[0].weight.dtype
+        shared_comp_input = self.mem_proj(projected_input.to(dtype=memory_dtype))  # [B, Nq, Dcomp]
+        shared_slot_input = self.slot_proj(
+            shared_comp_input.transpose(1, 2)
+        ).transpose(1, 2).contiguous()  # [B, M, Dcomp]
+        batch_size, num_slots, _ = shared_slot_input.shape
+        memory_keys = self.k_mem_out_proj(shared_slot_input)  # [B, M, Hkv * Dh]
+        memory_values = self.v_mem_out_proj(shared_slot_input)  # [B, M, Hkv * Dh]
 
         memory_keys = memory_keys.view(batch_size, num_slots, self.memory_num_key_value_heads, self.memory_head_dim)
         memory_values = memory_values.view(batch_size, num_slots, self.memory_num_key_value_heads, self.memory_head_dim)
@@ -471,10 +463,8 @@ class PECEngine(nn.Module):
         return {
             "extruder_latents": extruder_latents,
             "projected_input": projected_input,
-            "k_comp_input": k_comp_input,
-            "v_comp_input": v_comp_input,
-            "k_slot_input": k_slot_input,
-            "v_slot_input": v_slot_input,
+            "shared_comp_input": shared_comp_input,
+            "shared_slot_input": shared_slot_input,
             "memory_keys": memory_keys,
             "memory_values": memory_values,
             "profiler_hidden": prof_hidden,
