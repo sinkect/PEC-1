@@ -109,6 +109,50 @@ def _expand_memory_batch(memory_tensor: torch.Tensor, batch_size: int) -> torch.
     )
 
 
+def _record_memory_attention_mass(
+    self,
+    *,
+    full_attention_mask: torch.Tensor,
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    memory_kv_length: int,
+) -> None:
+    memory_holder = getattr(self, "_pec_memory_state_holder", None)
+    if memory_holder is None or not bool(getattr(memory_holder, "capture_attention_mass", False)):
+        return
+
+    with torch.no_grad():
+        attention_scores = torch.matmul(
+            query_states.float(),
+            key_states.float().transpose(-1, -2),
+        ) * float(self.scaling)  # [B, H, Tq, Tk]
+
+        attention_bias = full_attention_mask
+        if attention_bias.shape[1] == 1 and attention_scores.shape[1] != 1:
+            attention_bias = attention_bias.expand(-1, attention_scores.shape[1], -1, -1)
+        if attention_bias.dtype == torch.bool:
+            attention_scores = attention_scores.masked_fill(~attention_bias, float("-inf"))
+        else:
+            attention_scores = attention_scores + attention_bias.to(
+                device=attention_scores.device,
+                dtype=attention_scores.dtype,
+            )
+
+        attention_probs = torch.softmax(attention_scores, dim=-1)  # [B, H, Tq, Tk]
+        memory_mass = attention_probs[..., :memory_kv_length].sum(dim=-1).mean(dim=1)  # [B, Tq]
+
+    attention_mass_records = getattr(memory_holder, "attention_mass_records", None)
+    if attention_mass_records is None:
+        attention_mass_records = []
+        memory_holder.attention_mass_records = attention_mass_records
+    attention_mass_records.append(
+        {
+            "layer_idx": int(self.layer_idx),
+            "mass": memory_mass.detach().cpu(),
+        }
+    )
+
+
 def _qwen_memory_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -174,6 +218,13 @@ def _qwen_memory_attention_forward(
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)  # [B, H, M + Tk, Dh]
     value_states = repeat_kv(value_states, self.num_key_value_groups)  # [B, H, M + Tk, Dh]
+    _record_memory_attention_mass(
+        self,
+        full_attention_mask=full_attention_mask,
+        query_states=query_states,
+        key_states=key_states,
+        memory_kv_length=memory_keys.shape[2],
+    )
     attn_output = F.scaled_dot_product_attention(
         query_states,
         key_states,
@@ -435,20 +486,27 @@ class PECEngine(nn.Module):
         *,
         memory_keys: torch.Tensor,
         memory_values: torch.Tensor,
+        capture_attention_mass: bool = False,
     ):
         if self._composer_memory_holder is None:
             yield
             return
 
         previous_memory = getattr(self._composer_memory_holder, "memory_kv", None)
+        previous_capture_attention_mass = bool(getattr(self._composer_memory_holder, "capture_attention_mass", False))
+        previous_attention_mass_records = getattr(self._composer_memory_holder, "attention_mass_records", None)
         self._composer_memory_holder.memory_kv = {
             "memory_keys": memory_keys,
             "memory_values": memory_values,
         }
+        self._composer_memory_holder.capture_attention_mass = bool(capture_attention_mass)
+        self._composer_memory_holder.attention_mass_records = [] if capture_attention_mass else None
         try:
             yield
         finally:
             self._composer_memory_holder.memory_kv = previous_memory
+            self._composer_memory_holder.capture_attention_mass = previous_capture_attention_mass
+            self._composer_memory_holder.attention_mass_records = previous_attention_mass_records
 
     @torch.no_grad()
     def generate_with_memory(

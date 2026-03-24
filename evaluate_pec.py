@@ -269,6 +269,71 @@ def select_next_token(
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
+def summarize_memory_attention_mass_records(
+    *,
+    attention_mass_records: Sequence[Dict[str, Any]] | None,
+    composer_input_ids: torch.Tensor,
+    composer_attention_mask: torch.Tensor,
+    generated_ids: torch.Tensor | None,
+    composer_tokenizer,
+) -> Dict[str, Any] | None:
+    if not attention_mass_records:
+        return None
+    if composer_input_ids.shape[0] != 1:
+        return None
+
+    grouped_records: Dict[int, List[torch.Tensor]] = {}
+    for record in attention_mass_records:
+        layer_idx = int(record["layer_idx"])
+        grouped_records.setdefault(layer_idx, []).append(record["mass"])
+    if not grouped_records:
+        return None
+
+    layer_masses = {
+        layer_idx: torch.cat(records, dim=1)[0]
+        for layer_idx, records in grouped_records.items()
+    }
+    ordered_layer_indices = sorted(layer_masses)
+    prompt_token_count = int(composer_attention_mask[0].sum().item())
+    generated_id_list = [] if generated_ids is None or generated_ids.numel() == 0 else generated_ids[0].tolist()
+    tracked_generated_token_count = max(min(len(generated_id_list), layer_masses[ordered_layer_indices[0]].shape[0] - prompt_token_count), 0)
+
+    prompt_mean_by_layer = [
+        {
+            "layer_idx": layer_idx,
+            "mean_mass": float(layer_masses[layer_idx][:prompt_token_count].mean().item()),
+        }
+        for layer_idx in ordered_layer_indices
+    ]
+
+    generated_tokens = []
+    tracked_generated_ids = generated_id_list[:tracked_generated_token_count]
+    tracked_generated_token_texts = composer_tokenizer.convert_ids_to_tokens(tracked_generated_ids)
+    for token_index, token_text in enumerate(tracked_generated_token_texts):
+        generated_tokens.append(
+            {
+                "token_index": token_index,
+                "token": str(token_text),
+                "layer_masses": [
+                    {
+                        "layer_idx": layer_idx,
+                        "mass": float(layer_masses[layer_idx][prompt_token_count + token_index].item()),
+                    }
+                    for layer_idx in ordered_layer_indices
+                ],
+            }
+        )
+
+    return {
+        "prompt_token_count": prompt_token_count,
+        "prompt_mean_by_layer": prompt_mean_by_layer,
+        "generated_tokens": generated_tokens,
+        "generated_token_count": len(generated_id_list),
+        "tracked_generated_token_count": tracked_generated_token_count,
+        "untracked_generated_token_count": max(len(generated_id_list) - tracked_generated_token_count, 0),
+    }
+
+
 @torch.inference_mode()
 def generate_base_response(
     *,
@@ -355,6 +420,7 @@ def generate_pec_response(
     top_k: int = 20,
     min_p: float = 0.0,
     enable_thinking: bool,
+    capture_memory_attention_mass: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     generated_texts, gate_stats = generate_pec_responses(
         model=model,
@@ -372,6 +438,7 @@ def generate_pec_response(
         top_k=top_k,
         min_p=min_p,
         enable_thinking=enable_thinking,
+        capture_memory_attention_mass=capture_memory_attention_mass,
     )
     return generated_texts[0], gate_stats[0]
 
@@ -394,6 +461,7 @@ def generate_pec_responses(
     top_k: int = 20,
     min_p: float = 0.0,
     enable_thinking: bool,
+    capture_memory_attention_mass: bool = False,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     def summarize_tensor(tensor: torch.Tensor, *, prefix: str) -> Dict[str, Any]:
         tensor_float = tensor.detach().float()
@@ -464,7 +532,12 @@ def generate_pec_responses(
     memory_values = artifacts["memory_values"]
     memory_stats = summarize_memory_artifacts(extruder_latents, memory_keys, memory_values)
 
-    with model.composer_memory_context(memory_keys=memory_keys, memory_values=memory_values):
+    attention_mass_records = None
+    with model.composer_memory_context(
+        memory_keys=memory_keys,
+        memory_values=memory_values,
+        capture_attention_mass=capture_memory_attention_mass,
+    ):
         outputs = model.composer(
             input_ids=composer_inputs["input_ids"],
             attention_mask=composer_inputs["attention_mask"],
@@ -511,12 +584,26 @@ def generate_pec_responses(
             )
             next_token_logits = outputs.logits[:, -1, :]
             past_key_values = outputs.past_key_values
+        if capture_memory_attention_mass:
+            attention_mass_records = list(getattr(model._composer_memory_holder, "attention_mass_records", []) or [])
 
     if generated_tokens:
         generated_ids = torch.cat(generated_tokens, dim=1)
         generated_texts = [text.strip() for text in composer_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)]
     else:
+        generated_ids = None
         generated_texts = ["" for _ in clean_prompt_texts]
+
+    if capture_memory_attention_mass and len(memory_stats) == 1:
+        attention_mass_summary = summarize_memory_attention_mass_records(
+            attention_mass_records=attention_mass_records,
+            composer_input_ids=composer_inputs["input_ids"],
+            composer_attention_mask=composer_inputs["attention_mask"],
+            generated_ids=generated_ids,
+            composer_tokenizer=composer_tokenizer,
+        )
+        if attention_mass_summary is not None:
+            memory_stats[0]["memory_attention_mass"] = attention_mass_summary
 
     return generated_texts, memory_stats
 

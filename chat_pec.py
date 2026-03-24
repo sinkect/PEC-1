@@ -131,6 +131,33 @@ def print_response_block(
             row = ", ".join(f"{value:.4f}" for value in row_values)
             print(f"    q{row_index:02d} [{row}]", flush=True)
 
+    def print_memory_attention_mass(attention_mass: dict[str, Any]) -> None:
+        prompt_mean_by_layer = attention_mass.get("prompt_mean_by_layer", [])
+        generated_tokens = attention_mass.get("generated_tokens", [])
+        if prompt_mean_by_layer:
+            print("  Memory Attention Mass To KV (prompt-token mean over heads):", flush=True)
+            for entry in prompt_mean_by_layer:
+                print(f"    layer {entry['layer_idx']:02d}: {entry['mean_mass']:.4f}", flush=True)
+        if generated_tokens:
+            print("  Memory Attention Mass To KV (generated tokens, mean over heads):", flush=True)
+            for token_entry in generated_tokens:
+                layer_values = " ".join(
+                    f"L{layer_entry['layer_idx']:02d}={layer_entry['mass']:.4f}"
+                    for layer_entry in token_entry.get("layer_masses", [])
+                )
+                print(
+                    f"    tok{token_entry['token_index']:02d} {token_entry['token']!r} {layer_values}",
+                    flush=True,
+                )
+        untracked_generated_token_count = int(attention_mass.get("untracked_generated_token_count", 0))
+        if untracked_generated_token_count > 0:
+            print(
+                "  Memory Attention Mass Note: "
+                f"{untracked_generated_token_count} final generated token(s) have no follow-up forward pass, "
+                "so no per-token mass was recorded for them.",
+                flush=True,
+            )
+
     visible_prompt_display = "<empty>" if visible_prompt == "" else visible_prompt
 
     print(f"\n[{label}]", flush=True)
@@ -162,6 +189,8 @@ def print_response_block(
         print(f"  Memory slots: {memory_stats['memory_slots']}", flush=True)
         print_tensor_slice("K_mem[0, 0, :5, :8]", memory_stats["memory_key_slice"])
         print_tensor_slice("V_mem[0, 0, :5, :8]", memory_stats["memory_value_slice"])
+        if "memory_attention_mass" in memory_stats:
+            print_memory_attention_mass(memory_stats["memory_attention_mass"])
 
 
 def print_help() -> None:
@@ -297,6 +326,7 @@ def run_one_turn(
             top_k=sampling["top_k"],
             min_p=sampling["min_p"],
             enable_thinking=args.enable_thinking,
+            capture_memory_attention_mass=True,
         )
         pec_elapsed = time.perf_counter() - started_at
         cleaned_pec_prediction = strip_thinking_trace(raw_pec_prediction)
