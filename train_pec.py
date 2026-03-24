@@ -146,8 +146,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--morehop-target-span-mask-prob",
         type=float,
-        default=0.5,
-        help="Mask probability for MoreHopQA support-answer token spans.",
+        default=None,
+        help="Legacy uniform mask probability override for all MoreHopQA support-answer spans.",
+    )
+    parser.add_argument(
+        "--morehop-earlier-target-span-mask-prob",
+        type=float,
+        default=0.25,
+        help="Mask probability for earlier MoreHopQA grounded-answer spans.",
+    )
+    parser.add_argument(
+        "--morehop-last-target-span-mask-prob",
+        type=float,
+        default=0.8,
+        help="Mask probability for the last MoreHopQA grounded-answer span.",
     )
     parser.add_argument(
         "--morehop-base-mask-prob",
@@ -517,7 +529,9 @@ def build_stage_datasets(
         composer_tokenizer,
         eval_ratio: float,
         seed: int,
-        morehop_target_span_mask_prob: float,
+        morehop_target_span_mask_prob: Optional[float],
+        morehop_earlier_target_span_mask_prob: float,
+        morehop_last_target_span_mask_prob: float,
         morehop_base_mask_prob: float,
 ):
     split_indices = split_dataset_indices(len(base_dataset), test_size=eval_ratio, seed=seed)
@@ -532,6 +546,8 @@ def build_stage_datasets(
             shared_mask_prob=shared_mask_prob,
             tokenizer=composer_tokenizer,
             target_span_mask_prob=morehop_target_span_mask_prob,
+            morehop_earlier_target_span_mask_prob=morehop_earlier_target_span_mask_prob,
+            morehop_last_target_span_mask_prob=morehop_last_target_span_mask_prob,
             morehop_base_mask_prob=morehop_base_mask_prob,
         )
         eval_mask_prob = stage.mask_prob_end if stage.mask_prob_end is not None else stage.mask_prob_start
@@ -539,6 +555,8 @@ def build_stage_datasets(
             mask_prob=eval_mask_prob,
             tokenizer=composer_tokenizer,
             target_span_mask_prob=morehop_target_span_mask_prob,
+            morehop_earlier_target_span_mask_prob=morehop_earlier_target_span_mask_prob,
+            morehop_last_target_span_mask_prob=morehop_last_target_span_mask_prob,
             morehop_base_mask_prob=morehop_base_mask_prob,
         )
     else:
@@ -831,6 +849,8 @@ def main() -> None:
             eval_ratio=args.eval_ratio,
             seed=args.seed,
             morehop_target_span_mask_prob=args.morehop_target_span_mask_prob,
+            morehop_earlier_target_span_mask_prob=args.morehop_earlier_target_span_mask_prob,
+            morehop_last_target_span_mask_prob=args.morehop_last_target_span_mask_prob,
             morehop_base_mask_prob=args.morehop_base_mask_prob,
         )
 

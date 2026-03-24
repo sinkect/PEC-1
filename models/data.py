@@ -41,8 +41,10 @@ class EntityMasker:
         mask_prob: float = 0.4,
         shared_mask_prob: Optional[SharedMaskProbability] = None,
         tokenizer: Optional[PreTrainedTokenizer] = None,
-        target_span_mask_prob: float = 0.5,
+        target_span_mask_prob: Optional[float] = None,
         morehop_base_mask_prob: float = 0.1,
+        morehop_earlier_target_span_mask_prob: Optional[float] = None,
+        morehop_last_target_span_mask_prob: Optional[float] = None,
     ):
         try:
             import spacy
@@ -58,8 +60,19 @@ class EntityMasker:
         self.mask_prob = mask_prob
         self.shared_mask_prob = shared_mask_prob
         self.tokenizer = tokenizer
-        self.target_span_mask_prob = float(target_span_mask_prob)
         self.morehop_base_mask_prob = float(morehop_base_mask_prob)
+        uniform_target_span_mask_prob = 0.5 if target_span_mask_prob is None else float(target_span_mask_prob)
+        self.target_span_mask_prob = uniform_target_span_mask_prob
+        self.morehop_earlier_target_span_mask_prob = (
+            uniform_target_span_mask_prob
+            if morehop_earlier_target_span_mask_prob is None
+            else float(morehop_earlier_target_span_mask_prob)
+        )
+        self.morehop_last_target_span_mask_prob = (
+            uniform_target_span_mask_prob
+            if morehop_last_target_span_mask_prob is None
+            else float(morehop_last_target_span_mask_prob)
+        )
 
     def get_mask_prob(self) -> float:
         if self.shared_mask_prob is not None:
@@ -96,6 +109,19 @@ class EntityMasker:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         return merged
 
+    @staticmethod
+    def _morehop_target_span_mask_probability(
+        target_index: int,
+        num_targets: int,
+        *,
+        earlier_prob: float,
+        last_prob: float,
+    ) -> float:
+        if num_targets <= 1:
+            return float(last_prob)
+        progress = min(max(float(target_index) / float(num_targets - 1), 0.0), 1.0)
+        return float(earlier_prob + ((last_prob - earlier_prob) * progress))
+
     def _mask_with_entity_policy(self, text: str) -> str:
         doc = self.nlp(text)
         mask_prob = self.get_mask_prob()
@@ -112,16 +138,19 @@ class EntityMasker:
         self,
         text: str,
         target_texts: Sequence[str] | None,
-    ) -> List[Tuple[int, int]]:
+    ) -> List[Tuple[int, int, int]]:
         if not target_texts:
             return []
 
-        spans: List[Tuple[int, int]] = []
-        for target_text in target_texts:
+        spans: List[Tuple[int, int, int]] = []
+        for target_index, target_text in enumerate(target_texts):
             if not target_text:
                 continue
-            spans.extend(self._find_all_substring_spans(text, str(target_text)))
-        return self._merge_spans(spans)
+            spans.extend(
+                (span_start, span_end, target_index)
+                for span_start, span_end in self._find_all_substring_spans(text, str(target_text))
+            )
+        return sorted(spans, key=lambda item: (item[0], item[1], item[2]))
 
     def _tokenize_with_offsets(self, text: str) -> Optional[List[Tuple[int, int]]]:
         if self.tokenizer is None:
@@ -153,30 +182,46 @@ class EntityMasker:
         if not offset_mapping:
             return self._mask_with_entity_policy(text)
 
+        normalized_target_texts = [
+            str(target_text).strip()
+            for target_text in (target_texts or [])
+            if target_text is not None and str(target_text).strip()
+        ]
+        num_targets = len(normalized_target_texts)
+        if num_targets == 0:
+            return self._mask_with_entity_policy(text)
+
         # Find every occurrence of the grounded support answers in the raw prompt.
-        char_spans = self._resolve_morehop_char_spans(text, target_texts)
-        target_flags: List[bool] = []
+        char_spans = self._resolve_morehop_char_spans(text, normalized_target_texts)
+        token_target_indices: List[Optional[int]] = []
         for token_start, token_end in offset_mapping:
             if token_end <= token_start:
-                target_flags.append(False)
+                token_target_indices.append(None)
                 continue
-            target_flags.append(
-                any(token_start < span_end and token_end > span_start for span_start, span_end in char_spans)
-            )
+            overlapping_targets = [
+                target_index
+                for span_start, span_end, target_index in char_spans
+                if token_start < span_end and token_end > span_start
+            ]
+            token_target_indices.append(max(overlapping_targets) if overlapping_targets else None)
 
         # Collapse adjacent target tokens into contiguous ranges so each support answer
         # span is masked as a unit instead of token-by-token.
-        target_ranges: Dict[int, int] = {}
+        target_ranges: Dict[int, Tuple[int, int]] = {}
         token_index = 0
-        while token_index < len(target_flags):
-            if not target_flags[token_index]:
+        while token_index < len(token_target_indices):
+            target_index = token_target_indices[token_index]
+            if target_index is None:
                 token_index += 1
                 continue
             range_start = token_index
             token_index += 1
-            while token_index < len(target_flags) and target_flags[token_index]:
+            while (
+                token_index < len(token_target_indices)
+                and token_target_indices[token_index] == target_index
+            ):
                 token_index += 1
-            target_ranges[range_start] = token_index
+            target_ranges[range_start] = (token_index, target_index)
 
         pieces: List[str] = []
         previous_end = 0
@@ -193,16 +238,23 @@ class EntityMasker:
             if token_start > previous_end:
                 pieces.append(text[previous_end:token_start])
 
-            span_end_index = target_ranges.get(token_index)
-            if span_end_index is not None:
+            span_info = target_ranges.get(token_index)
+            if span_info is not None:
                 # Target spans get the higher masking probability to bias the visible
-                # prompt toward hiding grounded intermediate answers.
+                # prompt toward hiding later grounded answers more aggressively.
+                span_end_index, target_index = span_info
                 span_end = offset_mapping[span_end_index - 1][1]
-                if self.target_span_mask_prob >= 1.0:
+                span_mask_prob = self._morehop_target_span_mask_probability(
+                    target_index,
+                    num_targets,
+                    earlier_prob=self.morehop_earlier_target_span_mask_prob,
+                    last_prob=self.morehop_last_target_span_mask_prob,
+                )
+                if span_mask_prob >= 1.0:
                     pieces.append(self.mask_token)
-                elif self.target_span_mask_prob <= 0.0:
+                elif span_mask_prob <= 0.0:
                     pieces.append(text[token_start:span_end])
-                elif random.random() < self.target_span_mask_prob:
+                elif random.random() < span_mask_prob:
                     pieces.append(self.mask_token)
                 else:
                     pieces.append(text[token_start:span_end])
