@@ -121,7 +121,7 @@ class Extruder(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, num_query_tokens),
         )
-
+        self.query_self_attn = AttentionBlock(hidden_size, num_heads, num_key_value_heads)
         self.layers = nn.ModuleList([
             AttentionBlock(hidden_size, num_heads, num_key_value_heads)
             for _ in range(nums_layers)
@@ -203,6 +203,14 @@ class Extruder(nn.Module):
         """
         context = context.to(dtype=self.query_tokens.dtype)
         latents = self.build_query_tokens(context, attn_mask=attn_mask)  # [B, Nq, D]
+        should_checkpoint = self._should_checkpoint(latents)
+        if should_checkpoint:
+            def self_attn_forward(current_latents: torch.Tensor):
+                return self.query_self_attn(current_latents, current_latents)
+
+            latents = self._checkpoint_layer(self_attn_forward, latents)
+        else:
+            latents = self.query_self_attn(latents, latents)
 
         if attn_mask is not None:
             attn_mask = attn_mask.bool()
