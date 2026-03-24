@@ -198,6 +198,7 @@ class PECEngine(nn.Module):
         composer_path="Qwen/Qwen3-1.7B",
         num_query_tokens=16,
         morehop_align_lambda: float = 0.1,
+        morehop_align_mode: str = "weighted",
         freeze_profiler=False,
         freeze_composer=True,
         freeze_extruder=False,
@@ -227,6 +228,9 @@ class PECEngine(nn.Module):
         self.comp_dim = self.composer.config.hidden_size
         self.num_query_tokens = int(num_query_tokens)
         self.morehop_align_lambda = float(morehop_align_lambda)
+        if morehop_align_mode not in {"weighted", "last"}:
+            raise ValueError(f"Unsupported MoreHopQA align mode: {morehop_align_mode}")
+        self.morehop_align_mode = str(morehop_align_mode)
         self.memory_upper_layers = int(memory_upper_layers)
 
         if freeze_profiler:
@@ -592,6 +596,8 @@ class PECEngine(nn.Module):
             mh_target_attention_mask_list,
             active_rows_per_target,
         )):
+            if self.morehop_align_mode == "last":
+                active_rows = active_rows & (targets_per_row == (target_index + 1))
             if not torch.any(active_rows):
                 continue
 
@@ -610,12 +616,15 @@ class PECEngine(nn.Module):
                 r_k[active_rows].float(),
                 dim=-1,
             )
-            target_weights = similarities.new_tensor(
-                [
-                    self._morehop_alignment_weight_schedule(int(target_count))[target_index]
-                    for target_count in targets_per_row[active_rows].tolist()
-                ]
-            )
+            if self.morehop_align_mode == "last":
+                target_weights = torch.ones_like(similarities)
+            else:
+                target_weights = similarities.new_tensor(
+                    [
+                        self._morehop_alignment_weight_schedule(int(target_count))[target_index]
+                        for target_count in targets_per_row[active_rows].tolist()
+                    ]
+                )
             total_loss = total_loss + (((1.0 - similarities) * target_weights).sum()).to(dtype=total_loss.dtype)
             total_weight = total_weight + target_weights.sum().to(dtype=total_weight.dtype)
 

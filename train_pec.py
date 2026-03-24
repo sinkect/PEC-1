@@ -137,6 +137,13 @@ def parse_args() -> argparse.Namespace:
         help="Lambda for the MoreHopQA z_pool alignment auxiliary loss.",
     )
     parser.add_argument(
+        "--morehop-align-mode",
+        type=str,
+        choices=["weighted", "last"],
+        default="weighted",
+        help="How to aggregate MoreHopQA grounded-answer alignment targets.",
+    )
+    parser.add_argument(
         "--morehop-target-span-mask-prob",
         type=float,
         default=0.5,
@@ -778,6 +785,7 @@ def main() -> None:
         composer_path=args.composer_model_name,
         num_query_tokens=args.num_query_tokens,
         morehop_align_lambda=args.morehop_align_lambda,
+        morehop_align_mode=args.morehop_align_mode,
         freeze_profiler=args.freeze_profiler,
         freeze_extruder=args.freeze_extruder,
         memory_upper_layers=args.memory_upper_layers,
