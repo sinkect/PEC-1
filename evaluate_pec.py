@@ -31,6 +31,7 @@ from models.eval_utils import (
     compute_text_metrics,
     render_qwen_user_prompt,
     read_jsonl,
+    resolve_think_end_token_indices,
     slugify_model_name,
     strip_thinking_trace,
     thinking_mode_name,
@@ -522,6 +523,15 @@ def generate_pec_responses(
         max_length=max_composer_len,
     )
     composer_inputs = move_tokenized_batch(composer_inputs, device)
+    composer_memory_visible_from = torch.tensor(
+        resolve_think_end_token_indices(
+            composer_tokenizer,
+            composer_prompt_texts,
+            max_length=max_composer_len,
+        ),
+        device=device,
+        dtype=torch.long,
+    )
 
     artifacts = model.build_memory_artifacts(
         profiler_input_ids=profiler_inputs["input_ids"],
@@ -536,6 +546,7 @@ def generate_pec_responses(
     with model.composer_memory_context(
         memory_keys=memory_keys,
         memory_values=memory_values,
+        memory_visible_from=composer_memory_visible_from,
         capture_attention_mass=capture_memory_attention_mass,
     ):
         outputs = model.composer(
@@ -640,6 +651,10 @@ def infer_num_query_tokens_from_state_dict(state_dict: Dict[str, torch.Tensor]) 
 
 
 def infer_num_memory_slots_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> int | None:
+    memory_queries = state_dict.get("memory_compressor.memory_queries")
+    if isinstance(memory_queries, torch.Tensor) and memory_queries.ndim == 3:
+        return int(memory_queries.shape[1])
+
     slot_proj = state_dict.get("slot_proj.weight")
     if isinstance(slot_proj, torch.Tensor) and slot_proj.ndim == 2:
         return int(slot_proj.shape[0])
@@ -706,8 +721,9 @@ def load_pec_model(
             (
                 "extruder",
                 "post_extruder_norm",
-                "slot_proj",
                 "mem_proj",
+                "slot_proj",
+                "memory_compressor",
                 "k_mem_out_proj",
                 "v_mem_out_proj",
             )
@@ -2083,7 +2099,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profiler-path", type=str, default="answerdotai/ModernBERT-base")
     parser.add_argument("--pec-composer-model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--num-query-tokens", type=int, default=64)
-    parser.add_argument("--num-memory-slots", type=int, default=16)
+    parser.add_argument("--num-memory-slots", type=int, default=8)
     parser.add_argument("--mask-probability", type=float, default=0.3)
     parser.add_argument("--mask-seed", type=int, default=42)
     parser.add_argument("--max-profiler-len", type=int, default=6144)

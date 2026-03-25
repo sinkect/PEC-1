@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
+from .eval_utils import resolve_think_end_token_indices
 
 try:
     from transformers import PreTrainedTokenizer
@@ -532,10 +533,19 @@ class PECCollator:
             labels[index, :prompt_len] = -100
 
         labels[input_ids == self.composer_tokenizer.pad_token_id] = -100
+        memory_visible_from = torch.tensor(
+            resolve_think_end_token_indices(
+                self.composer_tokenizer,
+                prompt_texts,
+                max_length=self.max_composer_len,
+            ),
+            dtype=torch.long,
+        )
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "memory_visible_from": memory_visible_from,
         }
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -557,6 +567,7 @@ class PECCollator:
             "profiler_attention_mask": profiler_inputs["attention_mask"],
             "composer_input_ids": composer_batch["input_ids"],
             "composer_attention_mask": composer_batch["attention_mask"],
+            "composer_memory_visible_from": composer_batch["memory_visible_from"],
             "labels": composer_batch["labels"],
         }
         collated.update(self._build_morehop_target_batches(batch=batch))

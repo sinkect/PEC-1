@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profiler-path", type=str, default="answerdotai/ModernBERT-base")
     parser.add_argument("--pec-composer-model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--num-query-tokens", type=int, default=64)
-    parser.add_argument("--num-memory-slots", type=int, default=16)
+    parser.add_argument("--num-memory-slots", type=int, default=8)
     parser.add_argument("--mask-probability", type=float, default=0.3)
     parser.add_argument("--mask-seed", type=int, default=42)
     parser.add_argument("--max-profiler-len", type=int, default=6144)

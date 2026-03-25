@@ -89,6 +89,40 @@ class AttentionBlock(nn.Module):
         return latents + out  # [B, Nq, D]
 
 
+class MemoryCompressor(nn.Module):
+    def __init__(self, dim: int, num_memory_slots: int, num_heads: int):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+
+        self.dim = dim
+        self.num_memory_slots = num_memory_slots
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.memory_queries = nn.Parameter(torch.randn(1, num_memory_slots, dim) * 0.02)
+        self.norm = nn.RMSNorm(dim, eps=1e-6)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        batch_size, num_latents, hidden_dim = z.shape
+        num_slots = self.num_memory_slots
+        num_heads = self.num_heads
+        head_dim = self.head_dim
+
+        queries = self.memory_queries.expand(batch_size, -1, -1)
+        queries = queries.view(batch_size, num_slots, num_heads, head_dim).transpose(1, 2)
+        keys = z.view(batch_size, num_latents, num_heads, head_dim).transpose(1, 2)
+        values = z.view(batch_size, num_latents, num_heads, head_dim).transpose(1, 2)
+
+        compressed = F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            is_causal=False,
+        )
+        compressed = compressed.transpose(1, 2).contiguous().view(batch_size, num_slots, hidden_dim)
+        return self.norm(compressed)
+
+
 class Extruder(nn.Module):
     supports_gradient_checkpointing = True
 

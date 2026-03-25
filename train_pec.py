@@ -28,6 +28,7 @@ from models.dataset_mixing import (
     save_blend_metadata,
     save_sampled_by_source_as_jsonl,
 )
+from models.eval_utils import resolve_think_end_token_indices
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--process-name", type=str, default="pec_training")
     parser.add_argument("--num-query-tokens", type=int, default=64, help="Number of extruder latent tokens.")
-    parser.add_argument("--num-memory-slots", type=int, default=16, help="Number of projected KV memory slots.")
+    parser.add_argument("--num-memory-slots", type=int, default=8, help="Number of projected KV memory slots.")
     parser.add_argument("--memory-upper-layers", type=int, default=8)
     parser.add_argument(
         "--freeze-profiler",
@@ -434,12 +435,21 @@ class FixedSampleGenerationCallback(TrainerCallback):
             truncation=True,
             max_length=self.max_composer_len,
         )
+        composer_memory_visible_from = torch.tensor(
+            resolve_think_end_token_indices(
+                self.composer_tokenizer,
+                [composer_prompt_text],
+                max_length=self.max_composer_len,
+            ),
+            dtype=torch.long,
+        )
 
         generated_ids = model.generate_with_memory(
             profiler_input_ids=profiler_inputs["input_ids"],
             profiler_attention_mask=profiler_inputs["attention_mask"],
             composer_input_ids=composer_inputs["input_ids"],
             composer_attention_mask=composer_inputs["attention_mask"],
+            composer_memory_visible_from=composer_memory_visible_from,
             max_new_tokens=self.max_new_tokens,
         )
         generation = self.composer_tokenizer.batch_decode(
@@ -629,8 +639,9 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
         parameter
         for name, parameter in named_parameters
         if (
-            name.startswith("slot_proj.")
-            or name.startswith("mem_proj.")
+            name.startswith("mem_proj.")
+            or name.startswith("slot_proj.")
+            or name.startswith("memory_compressor.")
             or name.startswith("k_mem_out_proj.")
             or name.startswith("v_mem_out_proj.")
         )
@@ -638,8 +649,9 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
     covered_prefixes = (
         "profiler.",
         "extruder.",
-        "slot_proj.",
         "mem_proj.",
+        "slot_proj.",
+        "memory_compressor.",
         "k_mem_out_proj.",
         "v_mem_out_proj.",
     )
@@ -714,6 +726,7 @@ def initialize_model_from_checkpoint(model: PECEngine, checkpoint_dir: Path) -> 
             or key.startswith("profiler.")
             or key.startswith("mem_proj.")
             or key.startswith("slot_proj.")
+            or key.startswith("memory_compressor.")
             or key.startswith("k_mem_out_proj.")
             or key.startswith("v_mem_out_proj.")
         )

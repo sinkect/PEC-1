@@ -26,6 +26,7 @@ DEFAULT_BASE_MODELS: Sequence[str] = (
     "Qwen/Qwen3-4B",
     "Qwen/Qwen3-8B",
 )
+THINK_END_MARKER = "</think>"
 
 
 class BlendedMessagesToPECSamples(Dataset):
@@ -109,6 +110,46 @@ def render_qwen_user_prompt(
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
     )
+
+
+def resolve_think_end_token_index(
+    tokenizer: PreTrainedTokenizerBase,
+    text: str,
+    *,
+    max_length: int,
+    add_special_tokens: bool = True,
+) -> int:
+    normalized_text = str(text)
+    marker_index = normalized_text.find(THINK_END_MARKER)
+    if marker_index < 0:
+        return 0
+
+    prefix_text = normalized_text[: marker_index + len(THINK_END_MARKER)]
+    tokenized_prefix = tokenizer(
+        prefix_text,
+        add_special_tokens=add_special_tokens,
+        truncation=True,
+        max_length=max_length,
+    )["input_ids"]
+    return len(tokenized_prefix)
+
+
+def resolve_think_end_token_indices(
+    tokenizer: PreTrainedTokenizerBase,
+    texts: Sequence[str],
+    *,
+    max_length: int,
+    add_special_tokens: bool = True,
+) -> List[int]:
+    return [
+        resolve_think_end_token_index(
+            tokenizer,
+            text,
+            max_length=max_length,
+            add_special_tokens=add_special_tokens,
+        )
+        for text in texts
+    ]
 
 
 def thinking_mode_name(enable_thinking: bool) -> str:
