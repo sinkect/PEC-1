@@ -53,7 +53,6 @@ def _build_memory_attention_mask(
         query_length: int,
         token_kv_length: int,
         memory_kv_length: int,
-        memory_visible_from: torch.Tensor | None,
         cache_position: torch.LongTensor | None,
         device: torch.device,
 ) -> torch.Tensor:
@@ -63,27 +62,12 @@ def _build_memory_attention_mask(
         token_kv_length=token_kv_length,
         device=device,
     )  # [Tq]
-    memory_visibility = None
-    if memory_visible_from is not None:
-        memory_visible_from = memory_visible_from.to(device=device, dtype=torch.long).view(-1)
-        if memory_visible_from.shape[0] == 1 and batch_size > 1:
-            memory_visible_from = memory_visible_from.expand(batch_size)
-        if memory_visible_from.shape[0] != batch_size:
-            raise ValueError(
-                "Memory visibility batch size does not match decoder batch size: "
-                f"{memory_visible_from.shape[0]} vs {batch_size}"
-            )
-        memory_visibility = query_positions.view(1, 1, query_length, 1) >= memory_visible_from.view(batch_size, 1, 1, 1)
 
     if attention_mask is None:
         key_positions = torch.arange(token_kv_length, device=device)  # [Tk]
         token_mask = key_positions.view(1, 1, 1, token_kv_length) <= query_positions.view(1, 1, query_length, 1)
         token_mask = token_mask.expand(batch_size, 1, query_length, token_kv_length)
-        memory_mask = (
-            memory_visibility.expand(batch_size, 1, query_length, memory_kv_length)
-            if memory_visibility is not None
-            else torch.ones((batch_size, 1, query_length, memory_kv_length), dtype=torch.bool, device=device)
-        )
+        memory_mask = torch.ones((batch_size, 1, query_length, memory_kv_length), dtype=torch.bool, device=device)
         return torch.cat([memory_mask, token_mask], dim=-1)  # [B, 1, Tq, M + Tk]
 
     if attention_mask.ndim == 2:
@@ -91,11 +75,7 @@ def _build_memory_attention_mask(
         key_positions = torch.arange(token_kv_length, device=device)  # [Tk]
         token_mask = key_positions.view(1, 1, 1, token_kv_length) <= query_positions.view(1, 1, query_length, 1)
         token_mask = token_mask.expand(batch_size, 1, query_length, token_kv_length)
-        memory_mask = (
-            memory_visibility.expand(batch_size, 1, query_length, memory_kv_length)
-            if memory_visibility is not None
-            else torch.ones((batch_size, 1, query_length, memory_kv_length), dtype=torch.bool, device=device)
-        )
+        memory_mask = torch.ones((batch_size, 1, query_length, memory_kv_length), dtype=torch.bool, device=device)
         return torch.cat([memory_mask, token_mask & token_padding_mask], dim=-1)  # [B, 1, Tq, M + Tk]
 
     if attention_mask.ndim != 4:
@@ -103,14 +83,10 @@ def _build_memory_attention_mask(
 
     token_attention_mask = attention_mask[..., :token_kv_length].to(device=device)  # [B, 1, Tq, Tk]
     if token_attention_mask.dtype == torch.bool:
-        memory_mask = (
-            memory_visibility.expand(*token_attention_mask.shape[:-1], memory_kv_length)
-            if memory_visibility is not None
-            else torch.ones(
-                (*token_attention_mask.shape[:-1], memory_kv_length),
-                dtype=torch.bool,
-                device=device,
-            )
+        memory_mask = torch.ones(
+            (*token_attention_mask.shape[:-1], memory_kv_length),
+            dtype=torch.bool,
+            device=device,
         )
     else:
         memory_mask = torch.zeros(
@@ -118,11 +94,6 @@ def _build_memory_attention_mask(
             dtype=token_attention_mask.dtype,
             device=device,
         )
-        if memory_visibility is not None:
-            memory_mask = memory_mask.masked_fill(
-                ~memory_visibility.expand(*token_attention_mask.shape[:-1], memory_kv_length),
-                torch.finfo(token_attention_mask.dtype).min,
-            )
     return torch.cat([memory_mask, token_attention_mask], dim=-1)  # [B, 1, Tq, M + Tk]
 
 
@@ -240,7 +211,6 @@ def _qwen_memory_attention_forward(
         query_length=query_states.shape[2],
         token_kv_length=key_states.shape[2] - memory_keys.shape[2],
         memory_kv_length=memory_keys.shape[2],
-        memory_visible_from=getattr(memory_holder, "memory_visible_from", None),
         cache_position=cache_position,
         device=query_states.device,
     )
@@ -525,7 +495,6 @@ class PECEngine(nn.Module):
             *,
             memory_keys: torch.Tensor,
             memory_values: torch.Tensor,
-            memory_visible_from: torch.Tensor | None = None,
             capture_attention_mass: bool = False,
     ):
         if self._composer_memory_holder is None:
@@ -533,21 +502,18 @@ class PECEngine(nn.Module):
             return
 
         previous_memory = getattr(self._composer_memory_holder, "memory_kv", None)
-        previous_memory_visible_from = getattr(self._composer_memory_holder, "memory_visible_from", None)
         previous_capture_attention_mass = bool(getattr(self._composer_memory_holder, "capture_attention_mass", False))
         previous_attention_mass_records = getattr(self._composer_memory_holder, "attention_mass_records", None)
         self._composer_memory_holder.memory_kv = {
             "memory_keys": memory_keys,
             "memory_values": memory_values,
         }
-        self._composer_memory_holder.memory_visible_from = memory_visible_from
         self._composer_memory_holder.capture_attention_mass = bool(capture_attention_mass)
         self._composer_memory_holder.attention_mass_records = [] if capture_attention_mass else None
         try:
             yield
         finally:
             self._composer_memory_holder.memory_kv = previous_memory
-            self._composer_memory_holder.memory_visible_from = previous_memory_visible_from
             self._composer_memory_holder.capture_attention_mass = previous_capture_attention_mass
             self._composer_memory_holder.attention_mass_records = previous_attention_mass_records
 
@@ -559,7 +525,6 @@ class PECEngine(nn.Module):
             profiler_attention_mask: torch.Tensor,
             composer_input_ids: torch.Tensor,
             composer_attention_mask: torch.Tensor,
-            composer_memory_visible_from: torch.Tensor | None = None,
             max_new_tokens: int = 128,
     ) -> torch.Tensor:
         device = next(self.parameters()).device
@@ -567,8 +532,6 @@ class PECEngine(nn.Module):
         profiler_attention_mask = profiler_attention_mask.to(device)  # [B, Sprof]
         composer_input_ids = composer_input_ids.to(device)  # [B, Stok]
         composer_attention_mask = composer_attention_mask.to(device)  # [B, Stok]
-        if composer_memory_visible_from is not None:
-            composer_memory_visible_from = composer_memory_visible_from.to(device=device, dtype=torch.long)
 
         artifacts = self.build_memory_artifacts(
             profiler_input_ids=profiler_input_ids,
@@ -587,7 +550,6 @@ class PECEngine(nn.Module):
             with self.composer_memory_context(
                     memory_keys=artifacts["memory_keys"],
                     memory_values=artifacts["memory_values"],
-                    memory_visible_from=composer_memory_visible_from,
             ):
                 outputs = self.composer(
                     input_ids=composer_input_ids,
@@ -634,7 +596,6 @@ class PECEngine(nn.Module):
             profiler_attention_mask,
             composer_input_ids,
             composer_attention_mask,
-            composer_memory_visible_from=None,
             labels=None,
             mh_target_input_ids_list=None,
             mh_target_attention_mask_list=None,
@@ -650,16 +611,10 @@ class PECEngine(nn.Module):
         should_restore_memory = True
         if self._composer_memory_holder is not None:
             previous_memory = getattr(self._composer_memory_holder, "memory_kv", None)
-            previous_memory_visible_from = getattr(self._composer_memory_holder, "memory_visible_from", None)
             self._composer_memory_holder.memory_kv = {
                 "memory_keys": artifacts["memory_keys"],
                 "memory_values": artifacts["memory_values"],
             }
-            self._composer_memory_holder.memory_visible_from = (
-                None
-                if composer_memory_visible_from is None
-                else composer_memory_visible_from.to(device=composer_input_ids.device, dtype=torch.long)
-            )
             # Transformer layer checkpointing recomputes attention blocks during backward.
             # Keep the memory KV mounted until the next forward so recomputation sees the
             # same patched attention path instead of falling back to the original one.
@@ -676,12 +631,10 @@ class PECEngine(nn.Module):
         except Exception:
             if self._composer_memory_holder is not None:
                 self._composer_memory_holder.memory_kv = previous_memory
-                self._composer_memory_holder.memory_visible_from = previous_memory_visible_from
             raise
         else:
             if self._composer_memory_holder is not None and should_restore_memory:
                 self._composer_memory_holder.memory_kv = previous_memory
-                self._composer_memory_holder.memory_visible_from = previous_memory_visible_from
 
         answer_loss = outputs.loss
         mh_align_loss = self._compute_morehop_align_loss(

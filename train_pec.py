@@ -28,7 +28,6 @@ from models.dataset_mixing import (
     save_blend_metadata,
     save_sampled_by_source_as_jsonl,
 )
-from models.eval_utils import resolve_think_end_token_indices
 from models.losses import GateL1Trainer
 
 
@@ -449,21 +448,12 @@ class FixedSampleGenerationCallback(TrainerCallback):
             truncation=True,
             max_length=self.max_composer_len,
         )
-        composer_memory_visible_from = torch.tensor(
-            resolve_think_end_token_indices(
-                self.composer_tokenizer,
-                [composer_prompt_text],
-                max_length=self.max_composer_len,
-            ),
-            dtype=torch.long,
-        )
 
         generated_ids = model.generate_with_memory(
             profiler_input_ids=profiler_inputs["input_ids"],
             profiler_attention_mask=profiler_inputs["attention_mask"],
             composer_input_ids=composer_inputs["input_ids"],
             composer_attention_mask=composer_inputs["attention_mask"],
-            composer_memory_visible_from=composer_memory_visible_from,
             max_new_tokens=self.max_new_tokens,
         )
         generation = self.composer_tokenizer.batch_decode(
