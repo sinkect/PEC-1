@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from models.rationale import (
     char_spans_to_token_spans,
@@ -55,6 +60,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--flush-every", type=int, default=100)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--device-map",
+        type=str,
+        default=None,
+        help=(
+            "Hugging Face device_map for model sharding. "
+            "Examples: auto, balanced, sequential, cuda:0. "
+            "When unset and multiple CUDA GPUs are visible, defaults to auto."
+        ),
+    )
+    parser.add_argument(
+        "--max-memory-per-gpu",
+        type=str,
+        default=None,
+        help='Optional per-GPU max memory for device_map loading, e.g. "70GiB".',
+    )
+    parser.add_argument(
+        "--max-cpu-memory",
+        type=str,
+        default=None,
+        help='Optional CPU max memory for device_map loading, e.g. "128GiB".',
+    )
+    parser.add_argument(
+        "--offload-folder",
+        type=Path,
+        default=None,
+        help="Optional offload folder used when device_map spills weights to disk.",
+    )
     parser.add_argument("--cache-dir", type=Path, default=base_dir / ".cache" / "teacher_rationale")
     return parser.parse_args()
 
@@ -67,6 +100,50 @@ def get_device(requested_device: str | None) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def resolve_device_map_argument(args: argparse.Namespace, device: torch.device) -> str | Dict[str, str] | None:
+    if args.device_map is not None:
+        normalized = str(args.device_map).strip()
+        if not normalized:
+            return None
+        if normalized in {"auto", "balanced", "balanced_low_0", "sequential"}:
+            return normalized
+        return {"": normalized}
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        return "auto"
+    return None
+
+
+def build_max_memory_map(args: argparse.Namespace) -> Mapping[Any, str] | None:
+    max_memory: Dict[Any, str] = {}
+    if args.max_memory_per_gpu is not None and torch.cuda.is_available():
+        for gpu_index in range(torch.cuda.device_count()):
+            max_memory[gpu_index] = str(args.max_memory_per_gpu)
+    if args.max_cpu_memory is not None:
+        max_memory["cpu"] = str(args.max_cpu_memory)
+    return max_memory or None
+
+
+def resolve_model_input_device(model, fallback_device: torch.device) -> torch.device:
+    hf_device_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_device_map, dict) and hf_device_map:
+        candidate_devices: List[str] = []
+        for mapped_device in hf_device_map.values():
+            if isinstance(mapped_device, int):
+                candidate_devices.append(f"cuda:{mapped_device}")
+                continue
+            mapped_device_str = str(mapped_device)
+            if mapped_device_str in {"cpu", "disk", "meta"}:
+                continue
+            candidate_devices.append(mapped_device_str)
+        if candidate_devices:
+            return torch.device(candidate_devices[0])
+
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return fallback_device
 
 
 def ensure_tokenizer_padding(tokenizer) -> None:
@@ -123,7 +200,9 @@ def aggregate_answer_to_prompt_attention(
     if not selected_layers:
         raise ValueError("No attention tensors were returned by the teacher model.")
 
-    layer_tensors = [layer[0].float() for layer in selected_layers]  # [H, T, T]
+    answer_positions = answer_positions.to(dtype=torch.long, device="cpu")
+    prompt_positions = prompt_positions.to(dtype=torch.long, device="cpu")
+    layer_tensors = [layer[0].detach().float().cpu() for layer in selected_layers]  # [H, T, T]
     stacked = torch.stack(layer_tensors, dim=0)  # [L, H, T, T]
     answer_attention = stacked[:, :, answer_positions, :]
     prompt_attention = answer_attention[..., prompt_positions]
@@ -135,7 +214,7 @@ def build_teacher_record(
     sample: Dict[str, Any],
     tokenizer,
     model,
-    device: torch.device,
+    model_input_device: torch.device,
     max_seq_len: int,
     upper_layers: int,
 ) -> Dict[str, Any] | None:
@@ -204,7 +283,7 @@ def build_teacher_record(
     if answer_end <= answer_start:
         return None
 
-    full_inputs = {key: value.to(device) for key, value in full_inputs.items()}
+    full_inputs = {key: value.to(model_input_device) for key, value in full_inputs.items()}
     with torch.inference_mode():
         outputs = model(
             **full_inputs,
@@ -216,10 +295,10 @@ def build_teacher_record(
     prompt_positions = torch.arange(
         raw_prompt_start,
         raw_prompt_start + len(raw_prompt_ids),
-        device=device,
+        device="cpu",
         dtype=torch.long,
     )
-    answer_positions = torch.arange(answer_start, answer_end, device=device, dtype=torch.long)
+    answer_positions = torch.arange(answer_start, answer_end, device="cpu", dtype=torch.long)
     token_relevance = aggregate_answer_to_prompt_attention(
         attentions=outputs.attentions,
         answer_positions=answer_positions,
@@ -267,6 +346,8 @@ def main() -> None:
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     device = get_device(args.device)
+    device_map = resolve_device_map_argument(args, device)
+    max_memory = build_max_memory_map(args)
     dataset = build_dataset(args)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -276,21 +357,39 @@ def main() -> None:
     ensure_tokenizer_padding(tokenizer)
 
     model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model_load_kwargs: Dict[str, Any] = {
+        "torch_dtype": model_dtype,
+        "attn_implementation": args.attn_implementation,
+        "cache_dir": str(args.cache_dir),
+    }
+    if device_map is not None:
+        model_load_kwargs["device_map"] = device_map
+        model_load_kwargs["low_cpu_mem_usage"] = True
+        if max_memory is not None:
+            model_load_kwargs["max_memory"] = max_memory
+        if args.offload_folder is not None:
+            args.offload_folder.mkdir(parents=True, exist_ok=True)
+            model_load_kwargs["offload_folder"] = str(args.offload_folder)
+
     model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model_name,
-        torch_dtype=model_dtype,
-        attn_implementation=args.attn_implementation,
-        cache_dir=str(args.cache_dir),
+        **model_load_kwargs,
     )
-    model.to(device)
+    if device_map is None:
+        model.to(device)
     model.eval()
+    model_input_device = resolve_model_input_device(model, device)
 
     start_index = max(int(args.start_index), 0)
     end_index = len(dataset) if args.limit is None else min(len(dataset), start_index + int(args.limit))
+    hf_device_map = getattr(model, "hf_device_map", None)
     print(
         f"Building teacher rationale records: stage={args.stage} samples={end_index - start_index} "
-        f"model={args.teacher_model_name} device={device}"
+        f"model={args.teacher_model_name} device={device} device_map={device_map or 'none'} "
+        f"input_device={model_input_device}"
     )
+    if hf_device_map is not None:
+        print(f"Resolved hf_device_map: {hf_device_map}", flush=True)
 
     buffered_records: List[Dict[str, Any]] = []
     wrote_any_records = False
@@ -303,7 +402,7 @@ def main() -> None:
             sample=sample,
             tokenizer=tokenizer,
             model=model,
-            device=device,
+            model_input_device=model_input_device,
             max_seq_len=args.max_seq_len,
             upper_layers=args.upper_layers,
         )
