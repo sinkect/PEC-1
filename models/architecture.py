@@ -369,7 +369,6 @@ class PECEngine(nn.Module):
             nn.Linear(self.comp_dim, memory_proj_dim, bias=False),
             nn.RMSNorm(memory_proj_dim),
         ).to(dtype=memory_proj_dtype)
-        self.memory_kv_alpha = nn.Parameter(torch.tensor(1.0, dtype=memory_proj_dtype))
         self.rationale_head = MemoryRationaleHead(
             memory_dim=self.comp_dim,
             span_dim=self.prof_dim,
@@ -526,9 +525,6 @@ class PECEngine(nn.Module):
         batch_size, num_slots, _ = compressed_memory.shape
         memory_keys = self.k_mem_out_proj(compressed_memory)  # [B, M, Hkv * Dh]
         memory_values = self.v_mem_out_proj(compressed_memory)  # [B, M, Hkv * Dh]
-        memory_kv_alpha = self.memory_kv_alpha.to(dtype=memory_keys.dtype)
-        memory_keys = memory_keys * memory_kv_alpha
-        memory_values = memory_values * memory_kv_alpha
 
         memory_keys = memory_keys.view(batch_size, num_slots, self.memory_num_key_value_heads, self.memory_head_dim)
         memory_values = memory_values.view(batch_size, num_slots, self.memory_num_key_value_heads, self.memory_head_dim)
@@ -543,7 +539,6 @@ class PECEngine(nn.Module):
             "linear_memory": linear_memory,
             "attention_memory": attention_memory,
             "compressed_memory": compressed_memory,
-            "memory_kv_alpha": self.memory_kv_alpha.detach(),
             "memory_keys": memory_keys,
             "memory_values": memory_values,
             "profiler_hidden": prof_hidden,

@@ -664,7 +664,6 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
             name.startswith("mem_proj.")
             or name.startswith("slot_proj.")
             or name.startswith("memory_compressor.")
-            or name == "memory_kv_alpha"
             or name.startswith("k_mem_out_proj.")
             or name.startswith("v_mem_out_proj.")
         )
@@ -675,7 +674,6 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
         "mem_proj.",
         "slot_proj.",
         "memory_compressor.",
-        "memory_kv_alpha",
         "k_mem_out_proj.",
         "v_mem_out_proj.",
     )
