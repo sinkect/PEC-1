@@ -10,6 +10,8 @@ try:
 except ModuleNotFoundError:  # Optional for lightweight tests/utilities.
     PreTrainedTokenizer = Any
 
+from .rationale import char_spans_to_token_spans, normalize_relevance_distribution
+
 
 
 
@@ -298,12 +300,14 @@ class PECDataset(Dataset):
             composer_tokenizer: Optional[PreTrainedTokenizer] = None,
             composer_enable_thinking: bool = False,
             visible_prompt_mode: str = "masked",
+            teacher_rationale_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         self.data = data
         self.query_masker = query_masker
         self.composer_tokenizer = composer_tokenizer
         self.composer_enable_thinking = composer_enable_thinking
         self.visible_prompt_mode = visible_prompt_mode
+        self.teacher_rationale_lookup = teacher_rationale_lookup or {}
         self.eos_token = "<|im_end|>"
 
     def _render_qwen_chat(self, messages: List[Dict[str, str]], add_generation_prompt: bool) -> str:
@@ -380,12 +384,19 @@ class PECDataset(Dataset):
             "composer_visible_prompt_text": composer_texts["visible_prompt_text"],
         }
         for key in (
+            "example_id",
             "task_type",
             "source",
             "mh_target_texts",
         ):
             if key in item:
                 result[key] = item[key]
+        example_id = result.get("example_id")
+        if example_id is not None:
+            rationale_record = self.teacher_rationale_lookup.get(str(example_id))
+            if rationale_record is not None:
+                result["span_boundaries"] = rationale_record.get("span_boundaries", [])
+                result["teacher_relevance"] = rationale_record.get("teacher_relevance", [])
         return result
 
 
@@ -491,6 +502,89 @@ class PECCollator:
             "mh_target_attention_mask_list": mh_target_attention_mask_list,
         }
 
+    def _build_rationale_batch(
+        self,
+        *,
+        batch: List[Dict[str, Any]],
+        profiler_inputs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not any("teacher_relevance" in item and "span_boundaries" in item for item in batch):
+            return {}
+
+        offset_mapping = profiler_inputs.get("offset_mapping")
+        if offset_mapping is None:
+            return {}
+
+        attention_mask = profiler_inputs["attention_mask"]
+        raw_span_boundaries: List[List[List[int]]] = []
+        per_sample_token_spans: List[List[Tuple[int, int, float]]] = []
+        max_spans = 0
+        for sample_index, item in enumerate(batch):
+            sample_span_boundaries = [
+                [int(boundary[0]), int(boundary[1])]
+                for boundary in item.get("span_boundaries", [])
+                if isinstance(boundary, (list, tuple)) and len(boundary) == 2
+            ]
+            raw_span_boundaries.append(sample_span_boundaries)
+
+            sample_teacher_relevance = item.get("teacher_relevance", [])
+            if not sample_span_boundaries or not sample_teacher_relevance:
+                per_sample_token_spans.append([])
+                continue
+
+            valid_token_count = int(attention_mask[sample_index].sum().item())
+            mapped_token_spans = char_spans_to_token_spans(
+                offset_mapping=offset_mapping[sample_index],
+                span_boundaries=sample_span_boundaries,
+                valid_token_count=valid_token_count,
+            )
+            if not mapped_token_spans:
+                per_sample_token_spans.append([])
+                continue
+
+            selected_scores = [
+                float(sample_teacher_relevance[span_index])
+                for span_index, _, _ in mapped_token_spans
+                if span_index < len(sample_teacher_relevance)
+            ]
+            if not selected_scores:
+                per_sample_token_spans.append([])
+                continue
+
+            normalized_scores = normalize_relevance_distribution(selected_scores)
+            token_spans_with_scores = [
+                (token_start, token_end, normalized_scores[score_index])
+                for score_index, (_, token_start, token_end) in enumerate(mapped_token_spans)
+            ]
+            per_sample_token_spans.append(token_spans_with_scores)
+            max_spans = max(max_spans, len(token_spans_with_scores))
+
+        if max_spans <= 0:
+            return {}
+
+        span_token_boundaries = torch.full(
+            (len(batch), max_spans, 2),
+            fill_value=-1,
+            dtype=torch.long,
+        )
+        span_mask = torch.zeros((len(batch), max_spans), dtype=torch.bool)
+        teacher_relevance = torch.zeros((len(batch), max_spans), dtype=torch.float32)
+
+        for sample_index, token_spans_with_scores in enumerate(per_sample_token_spans):
+            for span_index, (token_start, token_end, relevance_score) in enumerate(token_spans_with_scores):
+                span_token_boundaries[sample_index, span_index, 0] = int(token_start)
+                span_token_boundaries[sample_index, span_index, 1] = int(token_end)
+                span_mask[sample_index, span_index] = True
+                teacher_relevance[sample_index, span_index] = float(relevance_score)
+
+        return {
+            "example_ids": [str(item.get("example_id", "")) for item in batch],
+            "span_boundaries": raw_span_boundaries,
+            "span_token_boundaries": span_token_boundaries,
+            "span_mask": span_mask,
+            "teacher_relevance": teacher_relevance,
+        }
+
     def _tokenize_composer_texts(
         self,
         full_texts: List[str],
@@ -544,7 +638,7 @@ class PECCollator:
             self.profiler_tokenizer,
             profiler_texts,
             max_length=self.max_profiler_len,
-            include_offsets=False,
+            include_offsets=any("span_boundaries" in item for item in batch),
         )
 
         composer_batch = self._tokenize_composer_texts(
@@ -560,4 +654,5 @@ class PECCollator:
             "labels": composer_batch["labels"],
         }
         collated.update(self._build_morehop_target_batches(batch=batch))
+        collated.update(self._build_rationale_batch(batch=batch, profiler_inputs=profiler_inputs))
         return collated

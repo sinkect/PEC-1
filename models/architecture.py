@@ -239,6 +239,52 @@ def _qwen_memory_attention_forward(
     return attn_output, None
 
 
+class MemoryRationaleHead(nn.Module):
+    def __init__(
+        self,
+        *,
+        memory_dim: int,
+        span_dim: int,
+        hidden_dim: int | None = None,
+    ) -> None:
+        super().__init__()
+        projection_dim = int(hidden_dim) if hidden_dim is not None else max(int(memory_dim), int(span_dim))
+        self.memory_proj = nn.Linear(memory_dim, projection_dim, bias=False)
+        self.span_proj = nn.Linear(span_dim, projection_dim, bias=False)
+
+    def forward(
+        self,
+        *,
+        memory_slots: torch.Tensor,
+        span_representations: torch.Tensor,
+        span_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, _, num_spans = memory_slots.shape[0], memory_slots.shape[1], span_representations.shape[1]
+        projected_memory = self.memory_proj(memory_slots).float()  # [B, S, Dr]
+        projected_spans = self.span_proj(span_representations).float()  # [B, K, Dr]
+        raw_scores = torch.einsum("bsd,bkd->bsk", projected_memory, projected_spans)  # [B, S, K]
+
+        span_mask = span_mask.to(device=raw_scores.device, dtype=torch.bool)
+        slot_distributions = raw_scores.new_zeros((batch_size, memory_slots.shape[1], num_spans))
+        active_rows = torch.any(span_mask, dim=-1)
+        if torch.any(active_rows):
+            active_scores = raw_scores[active_rows].masked_fill(
+                ~span_mask[active_rows].unsqueeze(1),
+                torch.finfo(raw_scores.dtype).min,
+            )
+            active_distributions = torch.softmax(active_scores, dim=-1)
+            active_distributions = active_distributions * span_mask[active_rows].unsqueeze(1).to(
+                dtype=active_distributions.dtype
+            )
+            slot_distributions[active_rows] = active_distributions
+
+        student_relevance = slot_distributions.mean(dim=1)  # [B, K]
+        student_relevance = student_relevance * span_mask.to(dtype=student_relevance.dtype)
+        normalization = student_relevance.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        student_relevance = student_relevance / normalization
+        return student_relevance, slot_distributions
+
+
 class PECEngine(nn.Module):
     supports_gradient_checkpointing = True
 
@@ -250,6 +296,7 @@ class PECEngine(nn.Module):
             num_memory_slots: int | None = 8,
             attn_mix_alpha: float = 0.0,
             morehop_align_lambda: float = 0.1,
+            rationale_lambda: float = 0.01,
             morehop_align_mode: str = "weighted",
             freeze_profiler=False,
             freeze_composer=True,
@@ -282,6 +329,7 @@ class PECEngine(nn.Module):
         self.num_memory_slots = int(num_memory_slots) if num_memory_slots is not None else self.num_query_tokens
         self.attn_mix_alpha = float(attn_mix_alpha)
         self.morehop_align_lambda = float(morehop_align_lambda)
+        self.rationale_lambda = float(rationale_lambda)
         if morehop_align_mode not in {"weighted", "last"}:
             raise ValueError(f"Unsupported MoreHopQA align mode: {morehop_align_mode}")
         self.morehop_align_mode = str(morehop_align_mode)
@@ -321,6 +369,12 @@ class PECEngine(nn.Module):
             nn.Linear(self.comp_dim, memory_proj_dim, bias=False),
             nn.RMSNorm(memory_proj_dim),
         ).to(dtype=memory_proj_dtype)
+        self.memory_kv_alpha = nn.Parameter(torch.tensor(1.0, dtype=memory_proj_dtype))
+        self.rationale_head = MemoryRationaleHead(
+            memory_dim=self.comp_dim,
+            span_dim=self.prof_dim,
+            hidden_dim=self.comp_dim,
+        )
 
         self.pad_token_id = self.composer.config.pad_token_id
         if self.pad_token_id is None:
@@ -403,6 +457,8 @@ class PECEngine(nn.Module):
         nn.init.xavier_uniform_(self.mem_proj[0].weight)
         nn.init.xavier_uniform_(self.k_mem_out_proj[0].weight)
         nn.init.xavier_uniform_(self.v_mem_out_proj[0].weight)
+        nn.init.xavier_uniform_(self.rationale_head.memory_proj.weight)
+        nn.init.xavier_uniform_(self.rationale_head.span_proj.weight)
         nn.init.ones_(self.post_extruder_norm.weight)
 
     @property
@@ -470,6 +526,9 @@ class PECEngine(nn.Module):
         batch_size, num_slots, _ = compressed_memory.shape
         memory_keys = self.k_mem_out_proj(compressed_memory)  # [B, M, Hkv * Dh]
         memory_values = self.v_mem_out_proj(compressed_memory)  # [B, M, Hkv * Dh]
+        memory_kv_alpha = self.memory_kv_alpha.to(dtype=memory_keys.dtype)
+        memory_keys = memory_keys * memory_kv_alpha
+        memory_values = memory_values * memory_kv_alpha
 
         memory_keys = memory_keys.view(batch_size, num_slots, self.memory_num_key_value_heads, self.memory_head_dim)
         memory_values = memory_values.view(batch_size, num_slots, self.memory_num_key_value_heads, self.memory_head_dim)
@@ -484,6 +543,7 @@ class PECEngine(nn.Module):
             "linear_memory": linear_memory,
             "attention_memory": attention_memory,
             "compressed_memory": compressed_memory,
+            "memory_kv_alpha": self.memory_kv_alpha.detach(),
             "memory_keys": memory_keys,
             "memory_values": memory_values,
             "profiler_hidden": prof_hidden,
@@ -599,9 +659,15 @@ class PECEngine(nn.Module):
             labels=None,
             mh_target_input_ids_list=None,
             mh_target_attention_mask_list=None,
+            example_ids=None,
+            span_boundaries=None,
+            span_token_boundaries=None,
+            span_mask=None,
+            teacher_relevance=None,
             return_projector_raw: bool = False,
             return_logits: bool = False,
     ):
+        del example_ids, span_boundaries
         artifacts = self.build_memory_artifacts(
             profiler_input_ids=profiler_input_ids,
             profiler_attention_mask=profiler_attention_mask,
@@ -642,21 +708,181 @@ class PECEngine(nn.Module):
             mh_target_input_ids_list=mh_target_input_ids_list,
             mh_target_attention_mask_list=mh_target_attention_mask_list,
         )
+        rationale_outputs = self._compute_rationale_outputs(
+            profiler_hidden=artifacts["profiler_hidden"],
+            memory_slots=artifacts["compressed_memory"],
+            span_token_boundaries=span_token_boundaries,
+            span_mask=span_mask,
+            teacher_relevance=teacher_relevance,
+        )
 
         total_loss = answer_loss
         if mh_align_loss is not None:
             total_loss = total_loss + (self.morehop_align_lambda * mh_align_loss)
+        if rationale_outputs["rationale_loss"] is not None:
+            total_loss = total_loss + (self.rationale_lambda * rationale_outputs["rationale_loss"])
 
         outputs_dict = {
             "loss": total_loss,
             "answer_loss": answer_loss,
             "mh_align_loss": mh_align_loss,
+            "rationale_loss": rationale_outputs["rationale_loss"],
+            "teacher_relevance_entropy": rationale_outputs["teacher_relevance_entropy"],
+            "student_relevance_entropy": rationale_outputs["student_relevance_entropy"],
+            "rationale_top1_hit": rationale_outputs["rationale_top1_hit"],
+            "rationale_top3_overlap": rationale_outputs["rationale_top3_overlap"],
+            "student_relevance": rationale_outputs["student_relevance"],
             "gate_scores": artifacts["gate_scores"],
             "logits": outputs.logits if return_logits else None,
         }
         if return_projector_raw:
             outputs_dict["projector_raw"] = artifacts["shared_comp_input"]
         return outputs_dict
+
+    @staticmethod
+    def _build_span_representations(
+        *,
+        profiler_hidden: torch.Tensor,
+        span_token_boundaries: torch.Tensor,
+        span_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = profiler_hidden.float()
+        batch_size, _, hidden_dim = hidden.shape
+        prefix_sum = torch.cat([hidden.new_zeros((batch_size, 1, hidden_dim)), hidden.cumsum(dim=1)], dim=1)
+
+        span_starts = span_token_boundaries[..., 0].clamp(min=0, max=hidden.shape[1])
+        span_ends = span_token_boundaries[..., 1].clamp(min=0, max=hidden.shape[1])
+        gather_shape = (-1, -1, hidden_dim)
+        gathered_starts = prefix_sum.gather(1, span_starts.unsqueeze(-1).expand(*gather_shape))
+        gathered_ends = prefix_sum.gather(1, span_ends.unsqueeze(-1).expand(*gather_shape))
+        span_sums = gathered_ends - gathered_starts
+
+        span_lengths = (span_ends - span_starts).clamp_min(1).unsqueeze(-1).to(dtype=span_sums.dtype)
+        span_representations = span_sums / span_lengths
+        return span_representations * span_mask.unsqueeze(-1).to(dtype=span_representations.dtype)
+
+    @staticmethod
+    def _mean_entropy(distribution: torch.Tensor, span_mask: torch.Tensor) -> torch.Tensor | None:
+        valid_rows = torch.any(span_mask, dim=-1)
+        if not torch.any(valid_rows):
+            return None
+        distribution = distribution.float() * span_mask.to(dtype=distribution.dtype)
+        distribution = distribution / distribution.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        entropy = -(distribution * distribution.clamp_min(1e-8).log()).sum(dim=-1)
+        return entropy[valid_rows].mean()
+
+    @staticmethod
+    def _compute_topk_alignment_metrics(
+        *,
+        teacher_distribution: torch.Tensor,
+        student_distribution: torch.Tensor,
+        span_mask: torch.Tensor,
+        k: int = 3,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        top1_hits: list[float] = []
+        topk_overlaps: list[float] = []
+        for teacher_row, student_row, mask_row in zip(
+            teacher_distribution.float(),
+            student_distribution.float(),
+            span_mask.bool(),
+        ):
+            if not torch.any(mask_row):
+                continue
+            teacher_valid = teacher_row[mask_row]
+            student_valid = student_row[mask_row]
+            if teacher_valid.numel() == 0:
+                continue
+            top1_hits.append(float(int(torch.argmax(teacher_valid).item()) == int(torch.argmax(student_valid).item())))
+            k_eff = min(int(k), int(teacher_valid.numel()))
+            teacher_topk = set(torch.topk(teacher_valid, k=k_eff).indices.tolist())
+            student_topk = set(torch.topk(student_valid, k=k_eff).indices.tolist())
+            topk_overlaps.append(len(teacher_topk & student_topk) / float(k_eff))
+
+        if not top1_hits:
+            return None, None
+
+        return (
+            teacher_distribution.new_tensor(sum(top1_hits) / len(top1_hits), dtype=torch.float32),
+            teacher_distribution.new_tensor(sum(topk_overlaps) / len(topk_overlaps), dtype=torch.float32),
+        )
+
+    def _compute_rationale_outputs(
+        self,
+        *,
+        profiler_hidden: torch.Tensor,
+        memory_slots: torch.Tensor,
+        span_token_boundaries: torch.Tensor | None,
+        span_mask: torch.Tensor | None,
+        teacher_relevance: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor | None]:
+        if span_token_boundaries is None or teacher_relevance is None:
+            return {
+                "rationale_loss": None,
+                "teacher_relevance_entropy": None,
+                "student_relevance_entropy": None,
+                "rationale_top1_hit": None,
+                "rationale_top3_overlap": None,
+                "student_relevance": None,
+            }
+
+        span_token_boundaries = span_token_boundaries.to(device=profiler_hidden.device)
+        if span_mask is None:
+            span_mask = span_token_boundaries[..., 0] >= 0
+        span_mask = span_mask.to(device=profiler_hidden.device, dtype=torch.bool)
+        teacher_distribution = teacher_relevance.to(device=profiler_hidden.device, dtype=torch.float32)
+        teacher_distribution = teacher_distribution * span_mask.to(dtype=teacher_distribution.dtype)
+        teacher_norm = teacher_distribution.sum(dim=-1, keepdim=True)
+        valid_rows = torch.any(span_mask, dim=-1) & (teacher_norm.squeeze(-1) > 0.0)
+        if not torch.any(valid_rows):
+            return {
+                "rationale_loss": None,
+                "teacher_relevance_entropy": None,
+                "student_relevance_entropy": None,
+                "rationale_top1_hit": None,
+                "rationale_top3_overlap": None,
+                "student_relevance": None,
+            }
+
+        teacher_distribution = torch.where(
+            teacher_norm > 0.0,
+            teacher_distribution / teacher_norm.clamp_min(1e-8),
+            teacher_distribution,
+        )
+
+        span_representations = self._build_span_representations(
+            profiler_hidden=profiler_hidden,
+            span_token_boundaries=span_token_boundaries,
+            span_mask=span_mask,
+        )
+        student_distribution, _ = self.rationale_head(
+            memory_slots=memory_slots,
+            span_representations=span_representations,
+            span_mask=span_mask,
+        )
+        student_distribution = student_distribution.float()
+        kl_per_row = F.kl_div(
+            student_distribution.clamp_min(1e-8).log(),
+            teacher_distribution,
+            reduction="none",
+        ).sum(dim=-1)
+        rationale_loss = kl_per_row[valid_rows].mean()
+
+        teacher_relevance_entropy = self._mean_entropy(teacher_distribution[valid_rows], span_mask[valid_rows])
+        student_relevance_entropy = self._mean_entropy(student_distribution[valid_rows], span_mask[valid_rows])
+        rationale_top1_hit, rationale_top3_overlap = self._compute_topk_alignment_metrics(
+            teacher_distribution=teacher_distribution[valid_rows],
+            student_distribution=student_distribution[valid_rows],
+            span_mask=span_mask[valid_rows],
+            k=3,
+        )
+        return {
+            "rationale_loss": rationale_loss,
+            "teacher_relevance_entropy": teacher_relevance_entropy,
+            "student_relevance_entropy": student_relevance_entropy,
+            "rationale_top1_hit": rationale_top1_hit,
+            "rationale_top3_overlap": rationale_top3_overlap,
+            "student_relevance": student_distribution,
+        }
 
     @staticmethod
     def _morehop_alignment_weight_schedule(num_targets: int) -> list[float]:

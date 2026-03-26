@@ -68,6 +68,38 @@ def compute_projector_raw_l2_loss(projector_raw: torch.Tensor) -> torch.Tensor:
     return projector_raw.float().square().mean()
 
 
+def _scalar_tensor_to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return float(value.detach().float().cpu().item())
+    if isinstance(value, (float, int)):
+        return float(value)
+    return None
+
+
+def _extract_auxiliary_metrics(outputs: Dict[str, Any]) -> Dict[str, float]:
+    metric_map = {
+        "answer_loss": "loss_ans",
+        "mh_align_loss": "loss_align",
+        "rationale_loss": "loss_rat",
+        "teacher_relevance_entropy": "teacher_rel_entropy",
+        "student_relevance_entropy": "student_rel_entropy",
+        "rationale_top1_hit": "teacher_student_top1_hit",
+        "rationale_top3_overlap": "teacher_student_top3_overlap",
+        "gate_l1_loss": "gate_l1_loss",
+        "projector_raw_l2_loss": "projector_raw_l2_loss",
+    }
+    metrics: Dict[str, float] = {}
+    for output_key, log_key in metric_map.items():
+        scalar_value = _scalar_tensor_to_float(outputs.get(output_key))
+        if scalar_value is not None:
+            metrics[log_key] = scalar_value
+    return metrics
+
+
 def trainer_compute_loss_with_gate_l1(
     trainer: Trainer,
     model: torch.nn.Module,
@@ -111,6 +143,8 @@ def trainer_compute_loss_with_gate_l1(
         total_loss = total_loss + (projector_raw_l2_config.lambda_value * projector_raw_l2_loss)
         outputs["projector_raw_l2_loss"] = projector_raw_l2_loss.detach()
 
+    setattr(trainer, "_pec_latest_aux_metrics", _extract_auxiliary_metrics(outputs))
+
     if return_outputs:
         return total_loss, outputs
     return total_loss
@@ -133,6 +167,7 @@ class GateL1Trainer(Trainer):
             warmup_ratio=gate_l1_warmup_ratio,
         )
         self.projector_raw_l2_config = ProjectorRawL2Config(lambda_value=projector_raw_l2_lambda)
+        self._pec_latest_aux_metrics: Dict[str, float] = {}
 
     def compute_loss(
         self,
@@ -150,3 +185,10 @@ class GateL1Trainer(Trainer):
             projector_raw_l2_config=self.projector_raw_l2_config,
             return_outputs=return_outputs,
         )
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        merged_logs = dict(logs)
+        latest_aux_metrics = getattr(self, "_pec_latest_aux_metrics", None) or {}
+        for key, value in latest_aux_metrics.items():
+            merged_logs.setdefault(key, value)
+        super().log(merged_logs, start_time=start_time)

@@ -29,6 +29,7 @@ from models.dataset_mixing import (
     save_sampled_by_source_as_jsonl,
 )
 from models.losses import GateL1Trainer
+from models.rationale import load_teacher_rationale_records, make_example_id
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,19 @@ def parse_args() -> argparse.Namespace:
         help="How to aggregate MoreHopQA grounded-answer alignment targets.",
     )
     parser.add_argument(
+        "--lambda-rat",
+        dest="lambda_rat",
+        type=float,
+        default=0.01,
+        help="Lambda for the span-level rationale distillation KL loss.",
+    )
+    parser.add_argument(
+        "--teacher-rationale-path",
+        type=Path,
+        default=None,
+        help="Optional path to offline teacher rationale jsonl/pt records keyed by example_id.",
+    )
+    parser.add_argument(
         "--morehop-target-span-mask-prob",
         type=float,
         default=None,
@@ -223,6 +237,7 @@ class BlendedMessagesToPECSamples(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.base_dataset[idx]
         normalized = {
+            "example_id": make_example_id(index=idx),
             "prompt": str(sample.get("prompt", "")).strip(),
             "answer": str(sample.get("answer", "")).strip(),
             "source": sample.get("source", ""),
@@ -548,6 +563,7 @@ def build_stage_datasets(
         morehop_earlier_target_span_mask_prob: float,
         morehop_last_target_span_mask_prob: float,
         morehop_base_mask_prob: float,
+        teacher_rationale_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     split_indices = split_dataset_indices(len(base_dataset), test_size=eval_ratio, seed=seed)
     train_base = Subset(base_dataset, split_indices["train"])
@@ -584,6 +600,7 @@ def build_stage_datasets(
         composer_tokenizer=composer_tokenizer,
         composer_enable_thinking=False,
         visible_prompt_mode=stage.visible_prompt_mode,
+        teacher_rationale_lookup=teacher_rationale_lookup,
     )
     eval_dataset = PECDataset(
         data=eval_base,
@@ -591,6 +608,7 @@ def build_stage_datasets(
         composer_tokenizer=composer_tokenizer,
         composer_enable_thinking=False,
         visible_prompt_mode=stage.visible_prompt_mode,
+        teacher_rationale_lookup=teacher_rationale_lookup,
     )
     return train_dataset, eval_dataset, shared_mask_prob
 
@@ -646,6 +664,7 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
             name.startswith("mem_proj.")
             or name.startswith("slot_proj.")
             or name.startswith("memory_compressor.")
+            or name == "memory_kv_alpha"
             or name.startswith("k_mem_out_proj.")
             or name.startswith("v_mem_out_proj.")
         )
@@ -656,6 +675,7 @@ def build_optimizer(model: PECEngine, args: argparse.Namespace) -> torch.optim.O
         "mem_proj.",
         "slot_proj.",
         "memory_compressor.",
+        "memory_kv_alpha",
         "k_mem_out_proj.",
         "v_mem_out_proj.",
     )
@@ -731,6 +751,7 @@ def initialize_model_from_checkpoint(model: PECEngine, checkpoint_dir: Path) -> 
             or key.startswith("mem_proj.")
             or key.startswith("slot_proj.")
             or key.startswith("memory_compressor.")
+            or key.startswith("rationale_head.")
             or key.startswith("k_mem_out_proj.")
             or key.startswith("v_mem_out_proj.")
         )
@@ -837,6 +858,7 @@ def main() -> None:
         num_memory_slots=args.num_memory_slots,
         attn_mix_alpha=args.attn_mix_alpha,
         morehop_align_lambda=args.morehop_align_lambda,
+        rationale_lambda=args.lambda_rat,
         morehop_align_mode=args.morehop_align_mode,
         freeze_profiler=args.freeze_profiler,
         freeze_extruder=args.freeze_extruder,
@@ -851,6 +873,14 @@ def main() -> None:
         max_profiler_len=args.max_profiler_len,
         max_composer_len=args.max_composer_len,
     )
+
+    teacher_rationale_lookup = {}
+    if args.teacher_rationale_path is not None:
+        print(f"Loading teacher rationale records from: {args.teacher_rationale_path}")
+        teacher_rationale_lookup = load_teacher_rationale_records(args.teacher_rationale_path)
+        print(f"Loaded {len(teacher_rationale_lookup)} teacher rationale records.")
+    elif args.lambda_rat > 0.0:
+        print("Teacher rationale path not provided; rationale loss will be skipped until teacher_relevance is available.")
 
     resume_checkpoint = args.resume_from_checkpoint
     for stage_name in args.stages:
@@ -886,6 +916,7 @@ def main() -> None:
             morehop_earlier_target_span_mask_prob=args.morehop_earlier_target_span_mask_prob,
             morehop_last_target_span_mask_prob=args.morehop_last_target_span_mask_prob,
             morehop_base_mask_prob=args.morehop_base_mask_prob,
+            teacher_rationale_lookup=teacher_rationale_lookup,
         )
 
         training_args = build_training_arguments(args, stage_output_dir, device)
@@ -927,13 +958,11 @@ def main() -> None:
                 f"max_lambda={args.gate_l1_max_lambda}, warmup_ratio={args.gate_l1_warmup_ratio}",
                 flush=True,
             )
-            trainer = GateL1Trainer(
-                **trainer_kwargs,
-                gate_l1_max_lambda=args.gate_l1_max_lambda,
-                gate_l1_warmup_ratio=args.gate_l1_warmup_ratio,
-            )
-        else:
-            trainer = Trainer(**trainer_kwargs)
+        trainer = GateL1Trainer(
+            **trainer_kwargs,
+            gate_l1_max_lambda=args.gate_l1_max_lambda,
+            gate_l1_warmup_ratio=args.gate_l1_warmup_ratio,
+        )
 
         print(f"Starting {stage.name} training...")
         if resume_checkpoint is not None:
