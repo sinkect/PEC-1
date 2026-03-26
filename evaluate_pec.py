@@ -668,6 +668,7 @@ def load_pec_model(
     composer_model_name: str,
     num_query_tokens: int,
     num_memory_slots: int,
+    attn_mix_alpha: float,
     device: torch.device,
 ):
     profiler_tokenizer = AutoTokenizer.from_pretrained(profiler_path)
@@ -700,6 +701,7 @@ def load_pec_model(
         composer_path=composer_model_name,
         num_query_tokens=resolved_num_query_tokens,
         num_memory_slots=resolved_num_memory_slots,
+        attn_mix_alpha=attn_mix_alpha,
     )
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     filtered_unexpected_keys = [
@@ -944,6 +946,7 @@ def evaluate_pec_re2_benchmark(
     composer_model_name: str,
     num_query_tokens: int,
     num_memory_slots: int,
+    attn_mix_alpha: float,
     max_profiler_len: int,
     max_composer_len: int,
     batch_size: int,
@@ -964,6 +967,7 @@ def evaluate_pec_re2_benchmark(
         composer_model_name=composer_model_name,
         num_query_tokens=num_query_tokens,
         num_memory_slots=num_memory_slots,
+        attn_mix_alpha=attn_mix_alpha,
         device=device,
     )
     predictions: List[Dict[str, Any]] = []
@@ -1157,6 +1161,8 @@ def build_re2_worker_command(
         str(args.num_query_tokens),
         "--num-memory-slots",
         str(args.num_memory_slots),
+        "--attn-mix-alpha",
+        str(args.attn_mix_alpha),
         "--max-profiler-len",
         str(args.max_profiler_len),
         "--max-composer-len",
@@ -1367,6 +1373,7 @@ def run_re2_paper_protocol(args: argparse.Namespace) -> None:
         "pec_composer_model": args.pec_composer_model,
         "num_query_tokens": args.num_query_tokens,
         "num_memory_slots": args.num_memory_slots,
+        "attn_mix_alpha": args.attn_mix_alpha,
         "max_new_tokens": args.max_new_tokens,
         "do_sample": bool(args.do_sample),
         "enable_thinking": bool(args.enable_thinking),
@@ -1429,6 +1436,7 @@ def run_re2_paper_protocol(args: argparse.Namespace) -> None:
                     composer_model_name=args.pec_composer_model,
                     num_query_tokens=args.num_query_tokens,
                     num_memory_slots=args.num_memory_slots,
+                    attn_mix_alpha=args.attn_mix_alpha,
                     max_profiler_len=args.max_profiler_len,
                     max_composer_len=args.max_composer_len,
                     batch_size=args.batch_size,
@@ -1576,6 +1584,7 @@ def evaluate_pec_experiment(
     composer_model_name: str,
     num_query_tokens: int,
     num_memory_slots: int,
+    attn_mix_alpha: float,
     mask_probability: float,
     mask_seed: int,
     max_profiler_len: int,
@@ -1599,6 +1608,7 @@ def evaluate_pec_experiment(
         composer_model_name=composer_model_name,
         num_query_tokens=num_query_tokens,
         num_memory_slots=num_memory_slots,
+        attn_mix_alpha=attn_mix_alpha,
         device=device,
     )
 
@@ -1793,6 +1803,7 @@ def run_eval_job(
         composer_model_name=job["model_name"],
         num_query_tokens=args.num_query_tokens,
         num_memory_slots=args.num_memory_slots,
+        attn_mix_alpha=args.attn_mix_alpha,
         mask_probability=args.mask_probability,
         mask_seed=args.mask_seed,
         max_profiler_len=args.max_profiler_len,
@@ -1866,6 +1877,8 @@ def build_worker_command(
         str(args.num_query_tokens),
         "--num-memory-slots",
         str(args.num_memory_slots),
+        "--attn-mix-alpha",
+        str(args.attn_mix_alpha),
         "--mask-probability",
         str(args.mask_probability),
         "--mask-seed",
@@ -2100,6 +2113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pec-composer-model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--num-query-tokens", type=int, default=64)
     parser.add_argument("--num-memory-slots", type=int, default=8)
+    parser.add_argument("--attn-mix-alpha", type=float, default=0.0)
     parser.add_argument("--mask-probability", type=float, default=0.3)
     parser.add_argument("--mask-seed", type=int, default=42)
     parser.add_argument("--max-profiler-len", type=int, default=6144)
@@ -2220,6 +2234,7 @@ def main() -> None:
                     composer_model_name=args.pec_composer_model,
                     num_query_tokens=args.num_query_tokens,
                     num_memory_slots=args.num_memory_slots,
+                    attn_mix_alpha=args.attn_mix_alpha,
                     max_profiler_len=args.max_profiler_len,
                     max_composer_len=args.max_composer_len,
                     batch_size=args.batch_size,
@@ -2311,6 +2326,7 @@ def main() -> None:
         "pec_composer_model": args.pec_composer_model,
         "soft_prompt_tokens": args.num_memory_slots,
         "latent_query_tokens": args.num_query_tokens,
+        "attn_mix_alpha": args.attn_mix_alpha,
         "batch_size": args.batch_size,
         "preview_samples": args.preview_samples,
         "gpu_ids": gpu_ids,

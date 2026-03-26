@@ -82,10 +82,10 @@ def trainer_compute_loss_with_gate_l1(
         projector_raw_l2_config = ProjectorRawL2Config()
 
     needs_projector_raw = projector_raw_l2_config.lambda_value > 0.0
-    outputs = model(
-        **inputs,
-        return_projector_raw=needs_projector_raw,
-    )
+    model_kwargs = dict(inputs)
+    if needs_projector_raw:
+        model_kwargs["return_projector_raw"] = True
+    outputs = model(**model_kwargs)
 
     standard_loss = outputs["loss"]
     if standard_loss is None:

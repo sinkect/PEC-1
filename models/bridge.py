@@ -208,13 +208,17 @@ class Extruder(nn.Module):
         self,
         context: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
+        return_gate_scores: bool = False,
     ) -> torch.Tensor:
         batch_size = context.shape[0]
         conditioning = self._build_conditioning_vector(context, attn_mask=attn_mask)  # [B, 2D]
         delta = self.delta_mlp(conditioning).view(batch_size, self.num_query_tokens, self.hidden_size)  # [B, Nq, D]
         gate = torch.sigmoid(self.gate_mlp(conditioning)).view(batch_size, self.num_query_tokens, 1)  # [B, Nq, 1]
         base_queries = self.query_tokens.expand(batch_size, -1, -1)  # [B, Nq, D]
-        return base_queries + (gate * delta)  # [B, Nq, D]
+        query_tokens = base_queries + (gate * delta)  # [B, Nq, D]
+        if return_gate_scores:
+            return query_tokens, gate
+        return query_tokens
 
     def _should_checkpoint(self, *tensors: Optional[torch.Tensor]) -> bool:
         if not self._gradient_checkpointing_enabled or not self.training:
@@ -230,13 +234,22 @@ class Extruder(nn.Module):
         self,
         context: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
+        return_gate_scores: bool = False,
     ) -> torch.Tensor:
         """
         Input: context [B, S, D]
         Output: latents [B, Nq, D]
         """
         context = context.to(dtype=self.query_tokens.dtype)
-        latents = self.build_query_tokens(context, attn_mask=attn_mask)  # [B, Nq, D]
+        if return_gate_scores:
+            latents, gate_scores = self.build_query_tokens(
+                context,
+                attn_mask=attn_mask,
+                return_gate_scores=True,
+            )
+        else:
+            latents = self.build_query_tokens(context, attn_mask=attn_mask)  # [B, Nq, D]
+            gate_scores = None
         should_checkpoint = self._should_checkpoint(latents)
         if should_checkpoint:
             def self_attn_forward(current_latents: torch.Tensor):
@@ -271,4 +284,7 @@ class Extruder(nn.Module):
             else:
                 latents = layer(latents, context, attn_mask=attn_mask)
 
-        return self.final_norm(latents)  # [B, Nq, D]
+        latents = self.final_norm(latents)  # [B, Nq, D]
+        if return_gate_scores:
+            return latents, gate_scores
+        return latents

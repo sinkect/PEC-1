@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pec-composer-model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--num-query-tokens", type=int, default=64)
     parser.add_argument("--num-memory-slots", type=int, default=8)
+    parser.add_argument("--attn-mix-alpha", type=float, default=0.0)
     parser.add_argument("--mask-probability", type=float, default=0.3)
     parser.add_argument("--mask-seed", type=int, default=42)
     parser.add_argument("--max-profiler-len", type=int, default=6144)
@@ -375,6 +376,7 @@ def main() -> None:
                 composer_model_name=args.pec_composer_model,
                 num_query_tokens=args.num_query_tokens,
                 num_memory_slots=args.num_memory_slots,
+                attn_mix_alpha=args.attn_mix_alpha,
                 device=device,
             )
             if args.apply_mask:

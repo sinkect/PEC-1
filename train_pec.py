@@ -29,6 +29,7 @@ from models.dataset_mixing import (
     save_sampled_by_source_as_jsonl,
 )
 from models.eval_utils import resolve_think_end_token_indices
+from models.losses import GateL1Trainer
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--process-name", type=str, default="pec_training")
     parser.add_argument("--num-query-tokens", type=int, default=64, help="Number of extruder latent tokens.")
     parser.add_argument("--num-memory-slots", type=int, default=8, help="Number of projected KV memory slots.")
+    parser.add_argument("--attn-mix-alpha", type=float, default=0.0, help="Residual weight for the attention memory-compressor branch.")
     parser.add_argument("--memory-upper-layers", type=int, default=8)
     parser.add_argument(
         "--freeze-profiler",
@@ -126,6 +128,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profiler-learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument(
+        "--gate-l1-max-lambda",
+        type=float,
+        default=0.0,
+        help="Maximum L1 regularization weight on the extruder dynamic-query gate values.",
+    )
+    parser.add_argument(
+        "--gate-l1-warmup-ratio",
+        type=float,
+        default=0.1,
+        help="Warmup fraction for gate L1 regularization.",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--eval-steps", type=int, default=500)
@@ -831,6 +845,7 @@ def main() -> None:
         composer_path=args.composer_model_name,
         num_query_tokens=args.num_query_tokens,
         num_memory_slots=args.num_memory_slots,
+        attn_mix_alpha=args.attn_mix_alpha,
         morehop_align_lambda=args.morehop_align_lambda,
         morehop_align_mode=args.morehop_align_mode,
         freeze_profiler=args.freeze_profiler,
@@ -907,7 +922,7 @@ def main() -> None:
             )
         )
 
-        trainer = Trainer(
+        trainer_kwargs = dict(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
@@ -916,6 +931,19 @@ def main() -> None:
             optimizers=(optimizer, None),
             callbacks=callbacks,
         )
+        if args.gate_l1_max_lambda > 0.0:
+            print(
+                "Gate L1 regularization enabled: "
+                f"max_lambda={args.gate_l1_max_lambda}, warmup_ratio={args.gate_l1_warmup_ratio}",
+                flush=True,
+            )
+            trainer = GateL1Trainer(
+                **trainer_kwargs,
+                gate_l1_max_lambda=args.gate_l1_max_lambda,
+                gate_l1_warmup_ratio=args.gate_l1_warmup_ratio,
+            )
+        else:
+            trainer = Trainer(**trainer_kwargs)
 
         print(f"Starting {stage.name} training...")
         if resume_checkpoint is not None:

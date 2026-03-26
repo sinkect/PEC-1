@@ -278,6 +278,7 @@ class PECEngine(nn.Module):
             composer_path="Qwen/Qwen3-1.7B",
             num_query_tokens=64,
             num_memory_slots: int | None = 8,
+            attn_mix_alpha: float = 0.0,
             morehop_align_lambda: float = 0.1,
             morehop_align_mode: str = "weighted",
             freeze_profiler=False,
@@ -309,6 +310,7 @@ class PECEngine(nn.Module):
         self.comp_dim = self.composer.config.hidden_size
         self.num_query_tokens = int(num_query_tokens)
         self.num_memory_slots = int(num_memory_slots) if num_memory_slots is not None else self.num_query_tokens
+        self.attn_mix_alpha = float(attn_mix_alpha)
         self.morehop_align_lambda = float(morehop_align_lambda)
         if morehop_align_mode not in {"weighted", "last"}:
             raise ValueError(f"Unsupported MoreHopQA align mode: {morehop_align_mode}")
@@ -341,7 +343,6 @@ class PECEngine(nn.Module):
             num_memory_slots=self.num_memory_slots,
             num_heads=self._resolve_memory_compressor_num_heads(),
         ).to(dtype=memory_proj_dtype)
-        self.attn_mix_alpha = 0.0
         self.k_mem_out_proj = nn.Sequential(
             nn.Linear(self.comp_dim, memory_proj_dim, bias=False),
             nn.RMSNorm(memory_proj_dim),
@@ -482,9 +483,10 @@ class PECEngine(nn.Module):
             attention_mask=profiler_attention_mask,
         )
         prof_hidden = prof_outputs.last_hidden_state  # [B, Sprof, Dprof]
-        extruder_latents = self.extruder(
+        extruder_latents, gate_scores = self.extruder(
             context=prof_hidden,
             attn_mask=profiler_attention_mask,
+            return_gate_scores=True,
         )  # [B, Nq, Dprof]
 
         projected_input = self.post_extruder_norm(extruder_latents)  # [B, Nq, Dprof]
@@ -506,6 +508,7 @@ class PECEngine(nn.Module):
 
         return {
             "extruder_latents": extruder_latents,
+            "gate_scores": gate_scores,
             "projected_input": projected_input,
             "shared_comp_input": shared_comp_input,
             "linear_memory": linear_memory,
@@ -635,6 +638,7 @@ class PECEngine(nn.Module):
             labels=None,
             mh_target_input_ids_list=None,
             mh_target_attention_mask_list=None,
+            return_projector_raw: bool = False,
             return_logits: bool = False,
     ):
         artifacts = self.build_memory_artifacts(
@@ -690,12 +694,16 @@ class PECEngine(nn.Module):
         if mh_align_loss is not None:
             total_loss = total_loss + (self.morehop_align_lambda * mh_align_loss)
 
-        return {
+        outputs_dict = {
             "loss": total_loss,
             "answer_loss": answer_loss,
             "mh_align_loss": mh_align_loss,
+            "gate_scores": artifacts["gate_scores"],
             "logits": outputs.logits if return_logits else None,
         }
+        if return_projector_raw:
+            outputs_dict["projector_raw"] = artifacts["shared_comp_input"]
+        return outputs_dict
 
     @staticmethod
     def _morehop_alignment_weight_schedule(num_targets: int) -> list[float]:
